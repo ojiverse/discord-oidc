@@ -1,0 +1,94 @@
+name: cd
+
+on:
+  # Deploy only after a green ci run on main.
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Never cancel a deploy halfway; runs queue instead.
+  group: cd-production
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deploy:
+    name: deploy production
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      # GitHub OIDC token, exchanged for short-lived 1Password access
+      # (Workload Identity / Credential Broker).
+      id-token: write
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Deploy the exact commit ci validated, not the merge ref.
+          ref: >-
+            ${{
+              github.event_name == 'workflow_run' &&
+              github.event.workflow_run.head_sha ||
+              github.sha
+            }}
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      # Same pin as ci.yml; wrangler's [build] command also installs
+      # worker-build, this keeps the version deterministic.
+      - run: cargo install worker-build --locked --version 0.8.5
+
+      # Loads every variable in the linked 1Password Environment as env vars
+      # (CLOUDFLARE_API_TOKEN, DISCORD_CLIENT_SECRET, OIDC_SIGNING_PRIVATE_KEY,
+      # optional OIDC_CLIENT_SECRETS_JSON). See docs/DEVELOPMENT.md.
+      - name: Load secrets from 1Password
+        uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2 # v5.0.1
+        with:
+          export-env: "true"
+        env:
+          OP_WORKLOAD_ID: ${{ vars.OP_WORKLOAD_ID }}
+          OP_ENVIRONMENT_ID: ${{ vars.OP_ENVIRONMENT_ID }}
+          OP_INTEGRATION_KEY: ${{ secrets.OP_INTEGRATION_KEY }}
+
+      - run: npx --yes wrangler@4.131.2 deploy
+
+      # secret bulk creates/updates the listed secrets and leaves others
+      # untouched. Runs after deploy so the Worker is guaranteed to exist.
+      - name: Sync worker secrets
+        run: |
+          : "${DISCORD_CLIENT_SECRET:?missing from 1Password environment}"
+          : "${OIDC_SIGNING_PRIVATE_KEY:?missing from 1Password environment}"
+          jq -n \
+            --arg discord "$DISCORD_CLIENT_SECRET" \
+            --arg key "$OIDC_SIGNING_PRIVATE_KEY" \
+            --arg clients "${OIDC_CLIENT_SECRETS_JSON:-}" \
+            '{
+               DISCORD_CLIENT_SECRET: $discord,
+               OIDC_SIGNING_PRIVATE_KEY: $key
+             } + (if $clients == "" then {}
+                  else { OIDC_CLIENT_SECRETS_JSON: $clients } end)' \
+            | npx --yes wrangler@4.131.2 secret bulk
+
+      # Public vars come from wrangler.toml, so the issuer URL is read back
+      # from the same place deploy used.
+      - name: Smoke check
+        run: |
+          issuer="$(sed -n 's/^OIDC_ISSUER_URL = "\(.*\)"/\1/p' wrangler.toml)"
+          : "${issuer:?OIDC_ISSUER_URL not set in wrangler.toml}"
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors \
+            "${issuer}/.well-known/openid-configuration" \
+            | jq -e --arg iss "$issuer" '.issuer == $iss'
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors \
+            "${issuer}/jwks.json" | jq -e '.keys | length >= 1'

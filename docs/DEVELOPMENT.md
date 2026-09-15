@@ -24,6 +24,9 @@ and `docs/SECURITY.md` in Rust on Cloudflare Workers (workers-rs).
   (RustSec advisories), wasm build, and a wrangler packaging dry-run.
   Actions are pinned to commit SHAs; `worker-build`, `wrangler`, and
   `cargo-audit` are version-pinned.
+- `.github/workflows/cd.yml` — production deploy. Runs when a `ci` run on
+  `main` completes successfully (`workflow_run`), or manually via
+  `workflow_dispatch`. See "Deployment" below.
 
 The boundary between the crates is the point of the design: everything an
 attacker could probe lives in `oidc-core` and is covered by host-side tests;
@@ -77,12 +80,55 @@ consume is check-and-delete inside one serialized object event; expired
 records are removed by a storage alarm sweep every two minutes while entries
 remain.
 
+## Deployment
+
+`.github/workflows/cd.yml` deploys to production. It triggers on a
+successful `ci` run on `main` (`workflow_run`, deploying the exact commit
+CI validated) and on `workflow_dispatch` for manual deploys. The job uses
+the `production` GitHub environment and runs serially — an in-flight deploy
+is never cancelled.
+
+Secrets come from 1Password, not GitHub secrets. The job requests a GitHub
+OIDC token (`id-token: write`), which `1password/load-secrets-action`
+exchanges for short-lived access through 1Password's Credential Broker
+(Workload Identity, public preview). Every variable in the linked 1Password
+Environment is exported into the job; the Environment must therefore
+contain only what deploy needs: `CLOUDFLARE_API_TOKEN`,
+`DISCORD_CLIENT_SECRET`, `OIDC_SIGNING_PRIVATE_KEY`, and
+`OIDC_CLIENT_SECRETS_JSON` when confidential clients are registered.
+
+The job then runs `wrangler deploy` (which rebuilds the wasm via the
+`[build]` command and applies Durable Object migrations), syncs the Worker
+secrets with `wrangler secret bulk`, and finishes with a smoke check that
+fetches the discovery document and JWKS from `OIDC_ISSUER_URL` — so a
+deploy is only green once the live Worker answers correctly.
+`secret bulk` is upsert-only: removing a Worker secret is a manual
+`wrangler secret delete`.
+
+One-time setup, none of which lives in the repository:
+
+- Cloudflare: create the `workers.dev` subdomain (open Workers & Pages in
+  the dashboard once) and an API token with Workers Scripts edit on the
+  account; put the account ID in the `CLOUDFLARE_ACCOUNT_ID` repo variable.
+- 1Password: an admin connects the GitHub organization under Developer →
+  integrations → GitHub Actions, which yields `OP_INTEGRATION_KEY` (kept as
+  a GitHub organization secret). The `discord-oidc-prod` Environment holds
+  the variables above and its GitHub Actions destination is restricted to
+  this repository's `cd.yml` on `main`. `OP_WORKLOAD_ID` and
+  `OP_ENVIRONMENT_ID` are repo variables.
+- GitHub: create the `production` environment, optionally with required
+  reviewers.
+- `wrangler.toml` `[vars]` must contain the real public values
+  (`OIDC_ISSUER_URL`, `DISCORD_CLIENT_ID`, `DISCORD_REQUIRED_GUILD_ID`,
+  `OIDC_CLIENTS_JSON`, `OIDC_SIGNING_KEY_ID`) before the first deploy —
+  they are non-secret and committed, and the smoke check fails while they
+  remain placeholders.
+
 ## Not implemented (out of scope for now)
 
 `/userinfo`, Dynamic Client Registration, pairwise subjects, refresh tokens,
 `email` scope, and Guild role claims — matching the documented non-goals in
-`docs/DESIGN.md`. Deploy automation is intentionally absent; CI stops at
-the packaging dry-run.
+`docs/DESIGN.md`.
 
 Only the `openid` scope is supported. The opaque `access_token` returned by
 `/token` is not bound to UserInfo or any other protected resource. OIDC
