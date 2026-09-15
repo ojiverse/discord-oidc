@@ -69,9 +69,9 @@ DISCORD_REQUIRED_GUILD_ID=123456789012345678
 ```text
 https://discord.id.ojiverse.example
 │
-├ client: communitytoken
-├ client: internal-dashboard
-└ client: another-service
+├ client: rp-a
+├ client: rp-b
+└ client: rp-c
 ```
 
 ID Token の `aud` は Provider 全体の固定値ではなく、authorization request の検証済み `client_id` に応じて決定します。
@@ -80,7 +80,7 @@ ID Token の `aud` は Provider 全体の固定値ではなく、authorization r
 {
   "iss": "https://discord.id.ojiverse.example",
   "sub": "123456789012345678",
-  "aud": "communitytoken-client-id"
+  "aud": "rp-a-client-id"
 }
 ```
 
@@ -140,9 +140,9 @@ OIDC_SIGNING_KEY_ID=...
 ```json
 [
   {
-    "client_id": "communitytoken-client-id",
+    "client_id": "rp-a-client-id",
     "redirect_uris": [
-      "https://communitytoken.ojiverse.example/auth/callback"
+      "https://rp-a.ojiverse.example/auth/callback"
     ],
     "type": "public"
   }
