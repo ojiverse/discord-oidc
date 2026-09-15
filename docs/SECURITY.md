@@ -23,7 +23,7 @@ Browser / Relying Party
 │ discord-oidc             │
 │ Cloudflare Worker        │
 │                          │
-│ OIDC Provider            │
+│ OpenID Provider          │
 │ AuthorizationState DO    │
 └────────────┬─────────────┘
              │ Discord OAuth2/API
@@ -62,7 +62,7 @@ Relying Party から渡される値は、登録済み client configuration と�
 11. signing private key、Discord client secret、confidential client secret を公開しない。
 12. Discord access / refresh token を Relying Party に渡さない。
 13. token、authorization code、secret を application log に記録しない。
-14. username、email、display name、Guild role を canonical identity key にしない。
+14. username、email、display name、Guild role を subject identifier の代わりに使用しない。
 
 ---
 
@@ -139,7 +139,7 @@ callback では Provider-generated state を照合した後にのみ transaction
 #### Mitigation
 
 - short `exp`
--正しい `iat`
+- 正しい `iat`
 - Relying Party から `nonce` が指定された場合は authorization transaction に保持し ID Token へ反映
 - RP は `iss` / signature / `aud` / `exp` / `nonce` を検証
 
@@ -192,7 +192,7 @@ OIDC_ISSUER_URL=https://discord.id.ojiverse.example
 - JWKS URI metadata
 - ID Token `iss`
 
-issuer URL は production 利用開始後、永続 identity namespace として扱います。
+issuer URL は production 利用開始後、長期的な issuer identifier として扱います。
 
 ---
 
@@ -207,7 +207,7 @@ username、email、display name など変更可能な属性を user identity と
 Discord-backed issuer の `sub` は Discord stable user ID (Snowflake) を使用します。
 
 ```text
-canonical principal = (iss, sub)
+canonical external identity = (iss, sub)
 ```
 
 以下を account key にしません。
@@ -224,11 +224,11 @@ canonical principal = (iss, sub)
 
 #### Threat
 
-required Guild に所属していない Discord user が OIDC identity を取得する。
+required Guild に所属していない Discord user が OIDC authentication を完了する。
 
 #### Mitigation
 
-Discord identity validation と Guild membership validation の両方が成功するまで Provider authorization code を発行しません。
+Discord user validation と Guild membership validation の両方が成功するまで Provider authorization code を発行しません。
 
 Guild membership lookup が pagination される場合は、required Guild を発見するか response を最後まで走査します。
 
@@ -262,14 +262,14 @@ Discord access token / refresh token がログ、Relying Party、storage へ不�
 
 #### Mitigation
 
-Discord token は upstream identity と Guild membership を確認するための一時 credential として扱います。
+Discord token は Discord user と Guild membership を確認するための一時 credential として扱います。
 
 - Relying Party へ返さない
 - application log に出さない
--認証だけが目的なら長期保存しない
+- authentication だけが目的なら長期保存しない
 - error response に含めない
 
-将来 Discord API access delegation を提供したくなった場合は、この login identity flow とは別機能として設計します。
+将来 Discord API access delegation を提供したくなった場合は、この OIDC authentication flow とは別機能として設計します。
 
 ---
 
@@ -393,7 +393,7 @@ OIDC Provider の compromise が自動的に Relying Party の deployment 権限
 
 ## 8. Logging / observability
 
-認証障害を追跡できるだけの observability は必要ですが、credential leakage を起こしてはいけません。
+authentication failure を追跡できるだけの observability は必要ですが、credential leakage を起こしてはいけません。
 
 ログに残してよい候補:
 
@@ -514,7 +514,7 @@ security-sensitive dependency は lockfile で固定し、Renovate / Dependabot 
 
 ## 13. Security reporting
 
-実際の脆弱性、credential leakage、認証 bypass の可能性を発見した場合は、公開 Issue への詳細な exploit 情報の投稿を避けてください。
+実際の脆弱性、credential leakage、authentication bypass の可能性を発見した場合は、公開 Issue への詳細な exploit 情報の投稿を避けてください。
 
 GitHub Private Vulnerability Reporting / Security Advisory が利用可能な場合は private channel を使用します。
 
@@ -531,4 +531,4 @@ security incident では、必要に応じて以下を直ちに rotation / revoc
 
 本プロジェクトは [Erisa/discord-oidc-worker](https://github.com/Erisa/discord-oidc-worker) を参考にしています。
 
-同実装の Discord OAuth2 + Cloudflare Workers + OIDC という構成を先行事例として参照していますが、本プロジェクトでは community-scoped multi-client OIDC Provider として security boundary を再整理し、Provider 自身の authorization code、client-specific `aud`、stable configurable issuer、required Guild admission policy を明示的に設計します。
+同実装の Discord OAuth2 + Cloudflare Workers + OIDC という構成を先行事例として参照していますが、本プロジェクトでは single-Guild / multi-client OpenID Provider として security boundary を整理し、Provider 自身の authorization code、client-specific `aud`、stable configurable issuer、required Guild membership verification を明示的に設計します。
