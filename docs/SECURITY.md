@@ -246,7 +246,7 @@ Guild membership は login 時点で検証します。
 
 対策として:
 
-- ID Token を短命にする
+- ID Token を短命にする(初期値 15 分)
 - RP session policy を適切に設定する
 - 高リスク用途では再認証間隔を短くする
 

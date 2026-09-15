@@ -426,7 +426,11 @@ name
 picture
 ```
 
-Guild / role 情報を追加する場合は claim namespace と情報露出範囲を別途定義します。
+`email` claim は発行しません。Discord OAuth で `email` scope も要求しません。
+
+初期実装では Guild / role claim を発行しません。role 情報が必要な Relying Party は Discord API を直接利用します。将来 Provider claim として追加する場合は、claim namespace と情報露出範囲を別途定義します。
+
+`exp` は `iat` から 15 分を初期値とし、運用に応じて調整可能な設定値とします。
 
 ### 7.2 Access Token / UserInfo
 
@@ -578,6 +582,10 @@ CI/CD credential は可能な範囲で repository ごとに scope を分離し�
 
 - Dynamic Client Registration
 - pairwise subject
+- OP 側の login session / Single Sign-On(authorization は毎回 Discord OAuth2 を経由します)
+- Refresh token / `offline_access` scope
+- `email` claim / Discord `email` scope
+- Guild / role claim(Relying Party が必要な場合は Discord API を直接利用します)
 - general-purpose IAM / directory service
 - password authentication
 - local user/password database

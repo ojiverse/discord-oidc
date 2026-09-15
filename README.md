@@ -202,6 +202,8 @@ Guild / role related claims
 
 責任を持たないもの:
 
+- Provider 側の login session / Single Sign-On
+- Refresh token / `offline_access` の発行
 - Relying Party 内部の user database
 - application-specific data model
 - application-specific authorization policy
