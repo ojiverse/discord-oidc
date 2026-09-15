@@ -144,7 +144,9 @@ OIDC_SIGNING_KEY_ID=...
     "redirect_uris": [
       "https://rp-a.ojiverse.example/auth/callback"
     ],
-    "type": "public"
+    "allowed_scopes": ["openid", "profile"],
+    "type": "public",
+    "token_endpoint_auth_method": "none"
   }
 ]
 ```

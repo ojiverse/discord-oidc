@@ -84,6 +84,8 @@ Relying Party から渡される値は、登録済み client configuration と�
 
 不正な `redirect_uri` の場合、エラー情報をその URI へ redirect してはいけません。
 
+`client_id` と `redirect_uri` の検証を通過した後に発生した protocol error は、登録済み `redirect_uri` へ `error` と受け取った `state` を付けて返します。
+
 ---
 
 ### 4.2 Authorization code interception / replay
@@ -96,7 +98,7 @@ authorization code を盗んだ第三者が token endpoint で交換する、ま
 
 - Authorization Code Flow + PKCE (`S256`)
 - code は十分な entropy を持つ cryptographically random value
-- storage には可能であれば plaintext code ではなく hash を保存
+- storage には plaintext code ではなく hash を保存
 - short TTL
 - code を client / redirect URI / PKCE challenge に binding
 - exchange 時に atomic consume
@@ -230,9 +232,9 @@ required Guild に所属していない Discord user が OIDC authentication を
 
 Discord user validation と Guild membership validation の両方が成功するまで Provider authorization code を発行しません。
 
-Guild membership lookup が pagination される場合は、required Guild を発見するか response を最後まで走査します。
+`guilds.members.read` scope を利用し、`GET /users/@me/guilds/{guild_id}/member` で required Guild への membership を直接照会します。member object が返れば member、404 であれば non-member と判定します。
 
-API error、rate limit、取得結果が不完全と判断できる状態では fail-open せず authentication を失敗させます。
+API error、rate limit、判定不能な response では fail-open せず authentication を失敗させます。
 
 ### Membership revocation latency
 
@@ -308,7 +310,7 @@ rotation 時には:
 
 confidential OIDC client を導入する場合、client secret は repository や `OIDC_CLIENTS_JSON` のような公開設定へ含めません。
 
-secret は Cloudflare secret storage へ格納します。
+secret は Cloudflare secret storage へ格納し、client authentication method は `client_secret_basic` とします。
 
 初期の browser/public clients については client secret に依存せず PKCE を使用します。
 
@@ -489,6 +491,8 @@ security-sensitive dependency は lockfile で固定し、Renovate / Dependabot 
 - unknown code
 - expired code
 - already consumed code
+- wrong `grant_type`
+- missing / invalid client authentication
 - wrong client
 - wrong redirect URI
 - wrong PKCE verifier

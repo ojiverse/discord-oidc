@@ -138,14 +138,14 @@ Guild role は `sub` を構成しません。必要であれば追加 claim と�
 
 ```text
 identify
-guilds
+guilds.members.read
 ```
 
-`GET /users/@me` で Discord user を取得し、`GET /users/@me/guilds` の結果から required Guild membership を検証します。
+`GET /users/@me` で Discord user を取得し、`GET /users/@me/guilds/{guild_id}/member` で required Guild への membership を直接照会します。member object が返れば member、404 であれば non-member と判定します。Guild 一覧の走査や pagination の処理は行いません。
 
-Guild 一覧 API が pagination を持つ場合、途中までの結果だけで non-member と判定してはいけません。required Guild が見つかるか、結果を最後まで検証する必要があります。
+API error、rate limit、判定不能な response の場合は fail-open せず authentication を失敗させます。
 
-role claim 等で Bot API が必要になった場合は別途 Bot Token を導入できますが、基本的な authentication flow のために Bot を必須にはしません。
+この endpoint が返す member object には role 情報が含まれるため、将来 Guild role claim を追加する場合も、基本的な authentication flow のために Bot Token は必須としません。
 
 ---
 
@@ -166,14 +166,18 @@ role claim 等で Bot API が必要になった場合は別途 Bot Token を導�
     "redirect_uris": [
       "https://rp-a.ojiverse.example/auth/callback"
     ],
-    "type": "public"
+    "allowed_scopes": ["openid", "profile"],
+    "type": "public",
+    "token_endpoint_auth_method": "none"
   },
   {
     "client_id": "rp-b-client-id",
     "redirect_uris": [
       "https://rp-b.ojiverse.example/oidc/callback"
     ],
-    "type": "confidential"
+    "allowed_scopes": ["openid", "profile"],
+    "type": "confidential",
+    "token_endpoint_auth_method": "client_secret_basic"
   }
 ]
 ```
@@ -247,11 +251,13 @@ GET /userinfo
 - `token_endpoint`
 - `jwks_uri`
 - `response_types_supported`
+- `grant_types_supported`
 - `subject_types_supported`
 - `id_token_signing_alg_values_supported`
 - `scopes_supported`
 - `claims_supported`
-- PKCE capability
+- `token_endpoint_auth_methods_supported`
+- `code_challenge_methods_supported`
 
 公開 metadata は実装された機能と一致している必要があります。
 
@@ -367,15 +373,16 @@ callback 完了時、Relying Party へ次のように戻します。
 
 Token endpoint は:
 
-1. authorization code を検索
-2. expiry を確認
-3. 未使用であることを確認
-4. client binding を確認
-5. redirect URI binding を確認
-6. PKCE verifier を確認
-7. confidential client の場合は client authentication を確認
-8. code を原子的に consume
-9. ID Token を発行
+1. `grant_type` が `authorization_code` であることを確認
+2. confidential client の場合は `client_secret_basic` による client authentication を確認
+3. authorization code を検索
+4. expiry を確認
+5. 未使用であることを確認
+6. client binding を確認
+7. redirect URI binding を確認
+8. PKCE verifier を確認
+9. code を原子的に consume
+10. ID Token を発行
 
 します。
 
@@ -427,7 +434,7 @@ Guild / role 情報を追加する場合は claim namespace と情報露出範�
 
 Discord access token を RP へ公開しません。
 
-初期実装で `/userinfo` が不要なら、必要以上の token/state model を先行実装しない方針とします。ただし OIDC/OAuth2 protocol requirement と実際に採用する library の要件を満たす形で最終決定します。
+token response は `/userinfo` の有無にかかわらず `access_token` を含める必要があります。初期実装で `/userinfo` を提供しない場合は、どの endpoint にも紐付かない opaque な access token を発行して仕様を満たし、追加の token/state model は先行実装しません。
 
 ---
 
@@ -490,6 +497,8 @@ OIDC_SIGNING_PRIVATE_KEY
 OIDC_SIGNING_KEY_ID
 ```
 
+署名 algorithm は RS256 とし、Relying Party library との interoperability を優先します。
+
 `/jwks.json` では対応する public key のみ公開します。
 
 key rotation 時には、既発行 token の検証期間を考慮して旧 public key を一定期間 JWKS に残せる設計とします。
@@ -536,6 +545,8 @@ proxy / custom domain の構成ミスによって `iss` が変化してはいけ
 ## 10. Error handling
 
 OAuth2 / OIDC endpoint では protocol に従った error response を返します。
+
+`/authorize` では、`client_id` と `redirect_uri` の検証に成功するまではいかなる URI にも redirect せず、error をその場で render します。検証後に発生した error (scope、PKCE、upstream 失敗など) は、登録済み `redirect_uri` へ `error` と受け取った `state` を付けて redirect して返します。
 
 内部エラー詳細、Discord access token、client secret、authorization code などを user-facing response へ含めません。
 
