@@ -17,4 +17,4 @@ percent-encoding = "2"
 
 [dev-dependencies]
 rand = "0.8"
-pollster = "0.4"
+pollster = "1.0"
