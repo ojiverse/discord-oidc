@@ -1,69 +1,70 @@
 # discord-oidc
 
-Discord を upstream identity source として利用する、Cloudflare Workers 上の community-scoped OpenID Connect Provider です。
+Discord OAuth2 を利用して Discord ユーザーを認証し、OpenID Connect (OIDC) の OpenID Provider (OP) として ID Token を発行する Cloudflare Workers 向けサービスです。
 
-このプロジェクトは、特定の Discord Guild に所属するユーザーを OIDC Principal として公開し、複数の OIDC Relying Party から同じ identity realm を利用できるようにすることを目的としています。
+各 deployment は **1 つの Discord Guild** に紐付きます。OIDC authentication を完了できるのは、その Guild の member として確認できた Discord user に限ります。
+
+1 つの deployment には複数の OIDC Client / Relying Party (RP) を登録できます。
 
 > [!IMPORTANT]
-> この Provider は用途ごとに 1 インスタンスずつ建てるものではありません。
-> **1 deployment = 1 community / identity realm** とし、その配下に複数の OIDC Client を登録することを基本モデルとします。
+> この Provider は Relying Party ごとに deployment するものではありません。
+> **1 deployment = 1 configured Discord Guild** とし、その OpenID Provider に複数の OIDC Client を登録することを基本モデルとします。
 
 ## Motivation
 
 Discord は OAuth2 を提供していますが、OIDC Provider ではありません。
 
-そのため、Discord アカウントを CommunityToken やその他のサービスから共通の認証基盤として利用しようとすると、各サービスが Discord OAuth2 を個別実装し、Discord 固有の user ID / guild / role といった概念をそれぞれ理解する必要があります。
+そのため Discord account を複数の Relying Party から共通して利用しようとすると、各 RP が Discord OAuth2 と Discord 固有 API を個別に実装する必要があります。
 
-`discord-oidc` は Discord OAuth2 を OIDC 境界へ正規化します。
+`discord-oidc` は Discord OAuth2 / Discord API による認証と Guild membership verification を OpenID Provider 側で処理し、RP には標準 OIDC interface を提供します。
 
 ```text
 Discord
-   │ OAuth2
+   │ OAuth2 / API
    ▼
 discord-oidc
-   │ OpenID Connect
+OpenID Provider
+   │ OIDC
    ├───────────────┬────────────────┐
    ▼               ▼                ▼
-CommunityToken   Service A        Service B
+RP / Client A   RP / Client B    RP / Client C
 ```
 
-Relying Party から見た canonical identity は常に次の組です。
+Relying Party が canonical external identity として扱う値は次の組です。
 
 ```text
 (iss, sub)
 ```
 
-- `iss`: この Provider の stable issuer URL
+- `iss`: OpenID Provider の stable issuer URL
 - `sub`: Discord の stable user ID (Snowflake)
 
-email、username、display name、guild role などを identity key として利用しません。
+email、username、display name、Guild role などを subject identifier の代わりに使用しません。
 
-## Community-scoped identity realm
+## Discord Guild binding
 
 各 deployment は対象 Discord Guild を 1 つ設定します。
 
-認証時には Discord OAuth2 でユーザーを確認した後、そのユーザーが設定済み Guild の member であることを検証します。Guild に所属していないユーザーには OIDC authorization を完了させません。
+認証時には Discord OAuth2 で user を確認した後、その user が設定済み Guild の member であることを検証します。Guild membership を確認できない場合、OIDC authorization を完了しません。
 
-例えば documentation 用の issuer を次のように設定した場合:
+例えば documentation 用の issuer を次のように設定できます。
 
 ```text
 https://discord.id.ojiverse.example
 ```
 
-この issuer は「特定アプリケーション用の Discord login endpoint」ではなく、「その Discord community の identity realm」を表します。
-
-実際の deployment domain は固定されません。`OIDC_ISSUER_URL` に任意の HTTPS URL を指定して利用できる設計とします。
+実際の issuer domain は固定されません。`OIDC_ISSUER_URL` に任意の stable HTTPS URL を指定して利用できる設計とします。
 
 ```env
 OIDC_ISSUER_URL=https://discord.id.ojiverse.example
 DISCORD_REQUIRED_GUILD_ID=123456789012345678
 ```
 
-`ojiverse.example` はあくまで documentation 用の予約ドメインです。
+`ojiverse.example` は documentation 用の予約ドメインです。
 
 ## One issuer, multiple clients
 
-1つの Provider deployment に複数の OIDC Client を登録します。
+1 つの OpenID Provider deployment に複数の OIDC Client を登録します。
 
 ```text
 https://discord.id.ojiverse.example
@@ -73,7 +74,7 @@ https://discord.id.ojiverse.example
 └ client: another-service
 ```
 
-ID Token の `aud` は固定値ではなく、認証要求元の検証済み `client_id` に応じて発行します。
+ID Token の `aud` は Provider 全体の固定値ではなく、authorization request の検証済み `client_id` に応じて決定します。
 
 ```json
 {
@@ -83,7 +84,7 @@ ID Token の `aud` は固定値ではなく、認証要求元の検証済み `cl
 }
 ```
 
-別の client が認証した場合、`iss` と `sub` は同じまま、`aud` がその client の `client_id` になります。
+別の OIDC Client が認証した場合、public subject を採用している限り `iss` と `sub` は同じまま、`aud` がその Client の `client_id` になります。
 
 初期設計では Dynamic Client Registration は実装せず、明示的な static client registry を利用します。
 
@@ -94,13 +95,13 @@ Cloudflare 上での運用を前提とします。
 想定コンポーネント:
 
 - Cloudflare Workers: OIDC / Discord OAuth2 HTTP endpoints
-- SQLite-backed Durable Objects: authorization transaction、single-use authorization code、必要な短期状態
-- Worker Secrets: Discord client secret、OIDC signing private key、confidential client secret
+- SQLite-backed Durable Objects: authorization transaction、single-use authorization code、必要な短期 state
+- Worker Secrets: Discord client secret、OIDC signing private key、confidential OIDC client secret
 - Custom Domain: stable OIDC issuer URL
 
-Cloudflare 固有機能は実装基盤として利用しますが、Relying Party との契約は標準的な OIDC over HTTPS とします。
+Cloudflare 固有機能は実装基盤として利用しますが、Relying Party との契約は標準 OIDC over HTTPS とします。
 
-同じ Cloudflare Account 上に Relying Party を配置する場合でも、Service Binding や共有 storage を OIDC の信頼境界にはしません。
+同じ Cloudflare Account 上に RP を配置する場合でも、Service Binding や shared storage を OIDC の信頼境界にはしません。
 
 ## Expected OIDC endpoints
 
@@ -132,7 +133,7 @@ OIDC_CLIENTS_JSON=...
 OIDC_SIGNING_KEY_ID=...
 ```
 
-`OIDC_CLIENTS_JSON` は、少数の trusted client を静的に登録する用途です。
+`OIDC_CLIENTS_JSON` は、少数の trusted OIDC Client を静的に登録する用途です。
 
 例:
 
@@ -155,14 +156,14 @@ OIDC_SIGNING_KEY_ID=...
 ```text
 DISCORD_CLIENT_SECRET
 OIDC_SIGNING_PRIVATE_KEY
-confidential client secrets (when supported)
+confidential OIDC client secrets (when supported)
 ```
 
 詳細は [docs/SECURITY.md](./docs/SECURITY.md) を参照してください。
 
 ## Identity claims
 
-必須となる identity claims は OIDC の標準 claim を中心にします。
+ID Token は OIDC の標準 claim を中心に構成します。
 
 ```text
 iss
@@ -173,24 +174,24 @@ exp
 nonce   # authorization request に存在する場合
 ```
 
-追加情報として、次のような claim を提供する余地があります。
+追加 claim として、次のような情報を提供する余地があります。
 
 ```text
 preferred_username
 name
 picture
-guild / role related claims
+Guild / role related claims
 ```
 
-ただし、これらは表示・authorization/context 用であり canonical identity ではありません。
+ただし、これらは表示または authorization 用の claim であり、subject identifier の代わりには使用しません。
 
 ## Repository scope
 
 このリポジトリが責任を持つもの:
 
 - Discord OAuth2 authorization
-- required Guild membership validation
-- OIDC Provider endpoints
+- required Discord Guild membership validation
+- OpenID Provider endpoints
 - OIDC client registry
 - authorization code lifecycle
 - PKCE validation
@@ -200,7 +201,7 @@ guild / role related claims
 責任を持たないもの:
 
 - Relying Party 内部の user database
-- CommunityToken の wallet / economy
+- application-specific data model
 - application-specific authorization policy
 - Discord bot interaction handling
 - Relying Party の session lifecycle
@@ -216,4 +217,4 @@ guild / role related claims
 
 同プロジェクトは Discord OAuth2 を Cloudflare Workers 上で OIDC へ bridge し、Cloudflare Access から Discord identity を利用できるようにする実装です。
 
-`discord-oidc` ではそのアイデアを参考にしつつ、特定の Cloudflare Access application に限定せず、community-scoped issuer + multiple OIDC clients という用途に合わせて独立した OIDC Provider として設計します。
+`discord-oidc` ではそのアイデアを参考にしつつ、Cloudflare Access 専用ではない OpenID Provider、single-Guild deployment、multiple OIDC clients、client-specific `aud` を明示的に設計します。
