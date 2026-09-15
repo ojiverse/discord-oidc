@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the stable toolchain from rust-toolchain.toml (rustfmt +
+      # clippy components, wasm32 target included there).
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      # Host target lints the whole workspace (incl. tests).
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Wasm target lints the worker crate as it will actually compile.
+      - run: cargo clippy -p discord-oidc-worker --target wasm32-unknown-unknown --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  build-wasm:
+    name: wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p discord-oidc-worker --release --target wasm32-unknown-unknown --locked
+
+  wrangler-package:
+    name: wrangler package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # worker-build performs the wasm-bindgen packaging wrangler dev/deploy
+      # rely on; --dry-run validates the full build without deploying.
+      - run: cargo install worker-build --locked
+      - run: npx --yes wrangler@4 deploy --dry-run --outdir dist

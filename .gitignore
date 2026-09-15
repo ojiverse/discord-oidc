@@ -1,0 +1,8 @@
+/target
+build
+dist
+node_modules
+.dev.vars
+.wrangler
+CLAUDE.local.md
+*.local.md

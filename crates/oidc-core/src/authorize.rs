@@ -1,0 +1,291 @@
+//! `/authorize` handling (DESIGN §6.1).
+//!
+//! Until `client_id` and `redirect_uri` are both validated, errors are
+//! rendered in place — never redirected. After validation, protocol errors
+//! redirect to the registered URI with `error` and the echoed `state`.
+
+use std::collections::BTreeMap;
+
+use url::{form_urlencoded, Url};
+
+use crate::config::Config;
+use crate::error::{error_page, OAuthErrorCode};
+use crate::pkce;
+use crate::response::CoreResponse;
+use crate::store::AuthorizationStore;
+use crate::transaction::AuthorizationTransaction;
+use crate::util::Entropy;
+
+/// Maximum accepted length of the raw query string.
+pub const MAX_QUERY_LEN: usize = 8192;
+/// Maximum length of an individual parameter value.
+const MAX_PARAM_LEN: usize = 2048;
+/// Maximum `state`/`nonce` length.
+const MAX_STATE_LEN: usize = 1024;
+
+/// A validated authorization request.
+#[derive(Debug)]
+pub struct ValidatedAuthorize {
+    /// Registered client.
+    pub client_id: String,
+    /// Registered redirect URI (exact match).
+    pub redirect_uri: String,
+    /// Requested scope string (a subset of the client's `allowed_scopes`).
+    pub scope: String,
+    /// RP `state` to echo back.
+    pub rp_state: Option<String>,
+    /// RP `nonce` for the ID Token.
+    pub nonce: Option<String>,
+    /// PKCE S256 challenge.
+    pub code_challenge: String,
+}
+
+/// The outcome of validating an `/authorize` request.
+#[derive(Debug)]
+pub enum AuthorizeVerdict {
+    /// Validation passed; proceed to create a transaction and redirect to
+    /// Discord.
+    Proceed(ValidatedAuthorize),
+    /// Redirect to the *registered* redirect URI with an OAuth error.
+    RedirectError {
+        /// Registered redirect URI.
+        redirect_uri: String,
+        /// OAuth error code.
+        code: OAuthErrorCode,
+        /// Safe, non-sensitive description.
+        description: Option<&'static str>,
+        /// RP `state` to echo, if one was provided.
+        state: Option<String>,
+    },
+    /// Render an error page; no redirect target is trustworthy.
+    RenderError {
+        /// HTTP status.
+        status: u16,
+        /// Short title.
+        title: &'static str,
+        /// Detail text.
+        description: String,
+    },
+}
+
+type Params = BTreeMap<String, Vec<String>>;
+
+fn parse_query(query: &str) -> Params {
+    let mut params: Params = BTreeMap::new();
+    for (k, v) in form_urlencoded::parse(query.as_bytes()) {
+        params
+            .entry(k.into_owned())
+            .or_default()
+            .push(v.into_owned());
+    }
+    params
+}
+
+/// Extracts a single-valued parameter. `Err(())` signals duplicates.
+fn single<'a>(params: &'a Params, name: &str) -> Result<Option<&'a str>, ()> {
+    match params.get(name).map(Vec::as_slice) {
+        None => Ok(None),
+        Some([v]) => Ok(Some(v.as_str())),
+        Some(_) => Err(()),
+    }
+}
+
+fn render(status: u16, title: &'static str, description: impl Into<String>) -> AuthorizeVerdict {
+    AuthorizeVerdict::RenderError {
+        status,
+        title,
+        description: description.into(),
+    }
+}
+
+fn redirect_err(
+    redirect_uri: &str,
+    code: OAuthErrorCode,
+    description: &'static str,
+    state: Option<String>,
+) -> AuthorizeVerdict {
+    AuthorizeVerdict::RedirectError {
+        redirect_uri: redirect_uri.to_string(),
+        code,
+        description: Some(description),
+        state,
+    }
+}
+
+/// Validates a raw `/authorize` query string per DESIGN §6.1.
+pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict {
+    if query.len() > MAX_QUERY_LEN {
+        return render(400, "invalid_request", "request too large");
+    }
+    let params = parse_query(query);
+
+    // Steps 1-2: client_id + redirect_uri must validate before any redirect.
+    let client_id = match single(&params, "client_id") {
+        Ok(Some(id)) if id.len() <= MAX_PARAM_LEN => id,
+        _ => return render(400, "invalid_request", "missing or invalid client_id"),
+    };
+    let Some(client) = cfg.clients.find(client_id) else {
+        return render(400, "unauthorized_client", "unknown client_id");
+    };
+    let redirect_uri = match single(&params, "redirect_uri") {
+        Ok(Some(uri)) if uri.len() <= MAX_PARAM_LEN => uri,
+        _ => return render(400, "invalid_request", "missing or invalid redirect_uri"),
+    };
+    if !client.redirect_uris.iter().any(|u| u == redirect_uri) {
+        return render(400, "invalid_request", "redirect_uri is not registered");
+    }
+    let state = single(&params, "state").ok().flatten().map(str::to_string);
+
+    // From here on, errors redirect to the registered redirect_uri.
+    let err = |code: OAuthErrorCode, desc: &'static str| {
+        redirect_err(redirect_uri, code, desc, state.clone())
+    };
+
+    for (name, values) in &params {
+        if values.len() > 1 {
+            return err(OAuthErrorCode::InvalidRequest, "duplicated parameter");
+        }
+        if values.iter().any(|v| v.len() > MAX_PARAM_LEN) {
+            return err(OAuthErrorCode::InvalidRequest, "parameter too long");
+        }
+        if !matches!(
+            name.as_str(),
+            "response_type"
+                | "client_id"
+                | "redirect_uri"
+                | "scope"
+                | "state"
+                | "nonce"
+                | "code_challenge"
+                | "code_challenge_method"
+        ) {
+            return err(OAuthErrorCode::InvalidRequest, "unexpected parameter");
+        }
+    }
+
+    match single(&params, "response_type") {
+        Ok(Some("code")) => {}
+        Ok(Some(_)) => {
+            return err(
+                OAuthErrorCode::UnsupportedResponseType,
+                "unsupported response_type",
+            )
+        }
+        _ => return err(OAuthErrorCode::InvalidRequest, "invalid response_type"),
+    }
+
+    let scope = match single(&params, "scope") {
+        Ok(Some(s)) if s.len() <= MAX_PARAM_LEN => s,
+        _ => return err(OAuthErrorCode::InvalidScope, "missing scope"),
+    };
+    let requested: Vec<&str> = scope.split_whitespace().collect();
+    if !requested.contains(&"openid") {
+        return err(OAuthErrorCode::InvalidScope, "openid scope required");
+    }
+    if requested
+        .iter()
+        .any(|s| !client.allowed_scopes.iter().any(|a| a == s))
+    {
+        return err(OAuthErrorCode::InvalidScope, "scope not allowed for client");
+    }
+
+    match single(&params, "code_challenge_method") {
+        Ok(Some(pkce::REQUIRED_CHALLENGE_METHOD)) => {}
+        _ => {
+            return err(
+                OAuthErrorCode::InvalidRequest,
+                "code_challenge_method must be S256",
+            )
+        }
+    }
+    let code_challenge = match single(&params, "code_challenge") {
+        Ok(Some(c)) if pkce::is_valid_code_challenge(c) => c.to_string(),
+        _ => return err(OAuthErrorCode::InvalidRequest, "invalid code_challenge"),
+    };
+
+    let nonce = single(&params, "nonce").ok().flatten().map(str::to_string);
+    if nonce.as_deref().is_some_and(|n| n.len() > MAX_STATE_LEN) {
+        return err(OAuthErrorCode::InvalidRequest, "nonce too long");
+    }
+    if state.as_deref().is_some_and(|s| s.len() > MAX_STATE_LEN) {
+        return err(OAuthErrorCode::InvalidRequest, "state too long");
+    }
+
+    AuthorizeVerdict::Proceed(ValidatedAuthorize {
+        client_id: client.client_id.clone(),
+        redirect_uri: redirect_uri.to_string(),
+        scope: requested.join(" "),
+        rp_state: state,
+        nonce,
+        code_challenge,
+    })
+}
+
+/// Builds the redirect location for an authorization error or success.
+pub fn redirect_with_params(uri: &str, pairs: &[(&str, &str)]) -> String {
+    let mut url = match Url::parse(uri) {
+        Ok(u) => u,
+        Err(_) => return uri.to_string(),
+    };
+    url.query_pairs_mut()
+        .extend_pairs(pairs.iter().map(|(k, v)| (*k, *v)));
+    url.into()
+}
+
+/// Full `/authorize` handler: validate, persist a transaction, and produce
+/// the Discord redirect (or an error response).
+pub async fn handle_authorize<S: AuthorizationStore, E: Entropy>(
+    query: &str,
+    cfg: &Config,
+    store: &S,
+    entropy: &mut E,
+    now: i64,
+) -> CoreResponse {
+    match validate_authorize_request(query, cfg) {
+        AuthorizeVerdict::RenderError {
+            status,
+            title,
+            description,
+        } => CoreResponse::Html {
+            status,
+            body: error_page(title, &description),
+        },
+        AuthorizeVerdict::RedirectError {
+            redirect_uri,
+            code,
+            description,
+            state,
+        } => {
+            let mut pairs = vec![("error", code.as_str())];
+            if let Some(d) = description {
+                pairs.push(("error_description", d));
+            }
+            if let Some(s) = state.as_deref() {
+                pairs.push(("state", s));
+            }
+            CoreResponse::Redirect(redirect_with_params(&redirect_uri, &pairs))
+        }
+        AuthorizeVerdict::Proceed(v) => {
+            let tx = AuthorizationTransaction::new(
+                v.client_id,
+                v.redirect_uri,
+                v.scope,
+                v.rp_state,
+                v.nonce,
+                v.code_challenge,
+                entropy,
+                now,
+            );
+            if store.put_transaction(&tx).await.is_err() {
+                return CoreResponse::Html {
+                    status: 500,
+                    body: error_page("server_error", "authorization storage failure"),
+                };
+            }
+            CoreResponse::Redirect(crate::discord::discord_authorize_url(
+                cfg,
+                &tx.discord_oauth_state,
+            ))
+        }
+    }
+}

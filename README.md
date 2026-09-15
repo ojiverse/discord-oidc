@@ -214,6 +214,7 @@ Guild / role related claims
 
 - [設計](./docs/DESIGN.md)
 - [セキュリティ設計](./docs/SECURITY.md)
+- [Development](./docs/DEVELOPMENT.md)
 
 ## Prior art
 

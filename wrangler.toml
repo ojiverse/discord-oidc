@@ -1,0 +1,30 @@
+name = "discord-oidc"
+main = "crates/discord-oidc-worker/build/worker/shim.mjs"
+compatibility_date = "2025-09-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release crates/discord-oidc-worker"
+
+[vars]
+# Non-secret configuration. See docs/DEVELOPMENT.md for the full model.
+OIDC_ISSUER_URL = "https://discord.id.ojiverse.example"
+DISCORD_CLIENT_ID = ""
+DISCORD_REQUIRED_GUILD_ID = ""
+OIDC_CLIENTS_JSON = "[]"
+OIDC_SIGNING_KEY_ID = "dev-key-1"
+# OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS = "[]"
+# OIDC_ID_TOKEN_TTL_SECONDS = "900"
+
+# Secrets (set via `wrangler secret put` or .dev.vars for local dev):
+#   DISCORD_CLIENT_SECRET
+#   OIDC_SIGNING_PRIVATE_KEY   (PKCS#8 PEM)
+#   OIDC_CLIENT_SECRETS_JSON   ({"client_id": "secret"} for confidential clients)
+
+[durable_objects]
+bindings = [
+  { name = "AUTHORIZATION_STATE", class_name = "AuthorizationState" },
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AuthorizationState"]
