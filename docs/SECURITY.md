@@ -310,7 +310,7 @@ rotation 時には:
 
 confidential OIDC client を導入する場合、client secret は repository や `OIDC_CLIENTS_JSON` のような公開設定へ含めません。
 
-secret は Cloudflare secret storage へ格納し、client authentication method は `client_secret_basic` とします。
+secret は Cloudflare secret storage へ格納し、client authentication method は `client_secret_basic` とします。client secret の照合は timing-safe な比較で行います。
 
 初期の browser/public clients については client secret に依存せず PKCE を使用します。
 
@@ -341,6 +341,8 @@ Public authorization endpoint は abuse の対象になり得ます。
 
 認証失敗時の処理が高コストな Discord API request を無制限に誘発しないようにします。
 
+Workers Free plan の Durable Objects 日次 quota はアカウント全体で共有され、超過は課金ではなく error になるため、quota 枯渇は全 OIDC client の認証停止を意味します。endpoint 保護と usage 監視を運用要件とし、必要に応じて OIDC Provider を専用 Cloudflare Account に分離します。
+
 ---
 
 ## 5. PKCE policy
@@ -352,6 +354,8 @@ code_challenge_method = S256
 ```
 
 `plain` は許可しません。
+
+`code_verifier` / `code_challenge` は RFC 7636 規定の 43–128 文字の base64url とし、検証は `BASE64URL-ENCODE(SHA256(verifier))` と challenge の完全一致で行います。
 
 confidential client で client authentication を行う場合でも、Authorization Code Flow の defense-in-depth として PKCE を利用できる設計を優先します。
 

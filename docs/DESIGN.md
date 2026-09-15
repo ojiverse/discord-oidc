@@ -240,6 +240,8 @@ GET  /jwks.json
 GET /userinfo
 ```
 
+`/token` への CORS は有効化しません。browser-based public client をサポートする必要が生じた場合は、登録 client の origin allowlist 方式で個別に設計します。
+
 ### 5.1 Discovery document
 
 `/.well-known/openid-configuration` は `OIDC_ISSUER_URL` を基準に endpoint URL を生成します。
@@ -250,14 +252,14 @@ GET /userinfo
 - `authorization_endpoint`
 - `token_endpoint`
 - `jwks_uri`
-- `response_types_supported`
-- `grant_types_supported`
-- `subject_types_supported`
-- `id_token_signing_alg_values_supported`
-- `scopes_supported`
+- `response_types_supported` = `["code"]`
+- `grant_types_supported` = `["authorization_code"]`
+- `subject_types_supported` = `["public"]`
+- `id_token_signing_alg_values_supported` = `["RS256"]`
+- `scopes_supported` = `["openid", "profile"]`
 - `claims_supported`
-- `token_endpoint_auth_methods_supported`
-- `code_challenge_methods_supported`
+- `token_endpoint_auth_methods_supported` = `["client_secret_basic", "none"]`
+- `code_challenge_methods_supported` = `["S256"]`
 
 公開 metadata は実装された機能と一致している必要があります。
 
@@ -288,8 +290,9 @@ Provider は最初に以下を検証します。
 2. `redirect_uri` が完全一致で allowlist 済み
 3. `response_type=code`
 4. `openid` scope が存在
-5. PKCE parameter が正しい
-6. request parameter のサイズ・形式が妥当
+5. request された scope が client の `allowed_scopes` の subset である
+6. PKCE parameter が正しい(`code_challenge` は 43–128 文字の base64url、`code_challenge_method=S256`)
+7. request parameter のサイズ・形式が妥当
 
 検証後、内部 authorization transaction を生成し、Discord OAuth2 authorization endpoint へ redirect します。
 
@@ -298,6 +301,8 @@ Provider は最初に以下を検証します。
 Discord 向けに Provider 自身の OAuth `state` を生成します。
 
 この state は Relying Party が `/authorize` に渡した `state` と同一値をそのまま Discord へ横流しするものではありません。
+
+`discord_oauth_state` は 256 bit の cryptographically random な base64url 値とします。Discord authorization endpoint は `https://discord.com/oauth2/authorize` 固定、要求 scope は `identify guilds.members.read` 固定とします。
 
 内部 transaction には概ね以下を保持します。
 
@@ -317,17 +322,22 @@ authorization_transaction
 
 Discord callback では Provider が生成した `discord_oauth_state` を照合します。
 
+authorization transaction の TTL は 10 分とし、失効した transaction は継続できません。transaction は callback 処理時に consume し、再利用を許しません。
+
 ### 6.3 Discord callback
 
-Discord authorization code を Discord token endpoint で交換します。
+Discord authorization code を Discord token endpoint (`https://discord.com/api/oauth2/token`) で交換します。Discord application の credential は Discord の仕様に従って送信します。
 
 Discord access token は以下の確認のためだけに利用します。
 
-- `/users/@me`
-- required Guild membership
-- 必要な追加 claim
+- `GET /users/@me` (Discord user ID の取得)
+- `GET /users/@me/guilds/{guild_id}/member` (required Guild membership)
+
+`sub` には `/users/@me` が返す `id` (Snowflake) をそのまま文字列として使用します。
 
 OIDC authentication に不要な Discord access / refresh token を長期保存しません。
+
+Discord が error を返した場合 (例: `access_denied`) や membership 検証に失敗した場合は、transaction に保持した RP の `state` とともに、対応する OIDC error を登録済み `redirect_uri` へ redirect して返します。
 
 検証成功後、Provider 自身の authorization code を新規発行します。
 
@@ -346,6 +356,8 @@ Provider が発行する authorization code は:
 - authenticated subject bound
 
 である必要があります。
+
+code は 256 bit の cryptographically random な base64url 値とし、TTL は 60 秒とします。storage には SHA-256 hash (`code_hash`) のみを保存します。
 
 概念:
 
@@ -388,6 +400,12 @@ Token endpoint は:
 
 code の検証と consume は atomic でなければなりません。
 
+request body は `application/x-www-form-urlencoded` とします。public client は `client_id` を body で送信し、code の client binding と照合します。
+
+client authentication の失敗は `401` + `WWW-Authenticate` header と `invalid_client` を返します。grant の検証失敗 (unknown / expired / consumed code、PKCE mismatch、client / redirect URI binding 不一致など) は `400` + `invalid_grant` とし、内部詳細を含めません。
+
+成功 response と error response の両方に `Cache-Control: no-store` と `Pragma: no-cache` を付与します。
+
 ---
 
 ## 7. Token model
@@ -403,6 +421,7 @@ aud
 iat
 exp
 nonce   # authorization request に存在する場合
+at_hash # access token とともに発行される場合
 ```
 
 例:
@@ -438,7 +457,7 @@ picture
 
 Discord access token を RP へ公開しません。
 
-token response は `/userinfo` の有無にかかわらず `access_token` を含める必要があります。初期実装で `/userinfo` を提供しない場合は、どの endpoint にも紐付かない opaque な access token を発行して仕様を満たし、追加の token/state model は先行実装しません。
+token response は `/userinfo` の有無にかかわらず `access_token` を含める必要があります。初期実装で `/userinfo` を提供しない場合は、256 bit の random な opaque access token を発行して仕様を満たします。この token はどの endpoint にも紐付かず storage にも保存しません。追加の token/state model は先行実装しません。
 
 ---
 
@@ -490,6 +509,8 @@ access_tokens (userinfo を実装する場合)
 
 Discord user profile を user directory として複製することも目的ではありません。
 
+expired な transaction / code は DO alarm による periodic sweep で削除します。
+
 ### 8.3 Signing keys
 
 OIDC signing private key は secret として管理します。
@@ -499,13 +520,14 @@ OIDC signing private key は secret として管理します。
 ```text
 OIDC_SIGNING_PRIVATE_KEY
 OIDC_SIGNING_KEY_ID
+OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS  # rotation 中に公開する旧 public JWK の配列 (optional)
 ```
 
 署名 algorithm は RS256 とし、Relying Party library との interoperability を優先します。
 
 `/jwks.json` では対応する public key のみ公開します。
 
-key rotation 時には、既発行 token の検証期間を考慮して旧 public key を一定期間 JWKS に残せる設計とします。
+key rotation 時には、新しい private key で署名を開始し、旧 public key は `OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS` 経由で既発行 token の expiry がすべて過ぎるまで JWKS に残します。旧 private key は保持しません。
 
 private key を Git repository や通常の公開設定へ保存してはいけません。
 
@@ -524,6 +546,8 @@ DISCORD_REQUIRED_GUILD_ID=...
 OIDC_CLIENTS_JSON=...
 OIDC_SIGNING_KEY_ID=...
 ```
+
+Discord application には `{OIDC_ISSUER_URL}/oauth/discord/callback` を redirect URI として登録します。
 
 ### 9.2 Secret
 
