@@ -85,7 +85,7 @@ issuer hostname はコードへ固定しません。
 OIDC_ISSUER_URL=https://discord.id.ojiverse.example
 ```
 
-`OIDC_ISSUER_URL` には任意の stable HTTPS URL を指定できます。
+`OIDC_ISSUER_URL` には任意の stable HTTPS origin を指定できます。各 endpoint は root の固定 path (`/authorize`, `/token`, `/jwks.json`, `/oauth/discord/callback`) で route されるため、path を含む issuer は受理しません。
 
 `ojiverse.example` はドキュメント用の予約ドメインです。
 
@@ -166,7 +166,7 @@ API error、rate limit、判定不能な response の場合は fail-open せず 
     "redirect_uris": [
       "https://rp-a.ojiverse.example/auth/callback"
     ],
-    "allowed_scopes": ["openid", "profile"],
+    "allowed_scopes": ["openid"],
     "type": "public",
     "token_endpoint_auth_method": "none"
   },
@@ -175,7 +175,7 @@ API error、rate limit、判定不能な response の場合は fail-open せず 
     "redirect_uris": [
       "https://rp-b.ojiverse.example/oidc/callback"
     ],
-    "allowed_scopes": ["openid", "profile"],
+    "allowed_scopes": ["openid"],
     "type": "confidential",
     "token_endpoint_auth_method": "client_secret_basic"
   }
@@ -256,7 +256,7 @@ GET /userinfo
 - `grant_types_supported` = `["authorization_code"]`
 - `subject_types_supported` = `["public"]`
 - `id_token_signing_alg_values_supported` = `["RS256"]`
-- `scopes_supported` = `["openid", "profile"]`
+- `scopes_supported` = `["openid"]`
 - `claims_supported`
 - `token_endpoint_auth_methods_supported` = `["client_secret_basic", "none"]`
 - `code_challenge_methods_supported` = `["S256"]`
@@ -294,6 +294,16 @@ Provider は最初に以下を検証します。
 6. PKCE parameter が正しい(`code_challenge` は 43–128 文字の base64url、`code_challenge_method=S256`)
 7. request parameter のサイズ・形式が妥当
 
+認識しない request parameter は無視します (拡張 parameter を送る client を壊さないため)。ただし OIDC が定義する `prompt` / `max_age` は例外で、黙って無視すると要求された security semantics をすり抜けるため、以下の fail-closed ポリシーを取ります。
+
+- `prompt=none`: silent authentication を成立させる手段 (provider 側 session) がないため `login_required` error を登録 `redirect_uri` へ返し、Discord へは redirect しません
+- `prompt=login`: Discord OAuth は再認証を保証しないため `login_required` error を返します。Discord の `prompt=consent` は authorization の再承認であり再認証ではないため、代用には使いません
+- `prompt=consent`: Discord authorization request の `prompt=consent` へそのまま対応付けます (consent semantics が一致するため)
+- `prompt=select_account`: Discord に account selection 機構がないため `account_selection_required` error を返します
+- `prompt=none` と他の値の併用: `invalid_request` error を返します
+- 未知の `prompt` 値: 無視します
+- `max_age`: 非負整数として検証し、指定された場合は常に `login_required` error を返します。信頼できる upstream authentication time が取得できず、`auth_time` を捏造して成功扱いにはしません
+
 検証後、内部 authorization transaction を生成し、Discord OAuth2 authorization endpoint へ redirect します。
 
 ### 6.2 Discord OAuth2
@@ -326,7 +336,7 @@ authorization transaction の TTL は 10 分とし、失効した transaction �
 
 ### 6.3 Discord callback
 
-Discord authorization code を Discord token endpoint (`https://discord.com/api/oauth2/token`) で交換します。Discord application の credential は Discord の仕様に従って送信します。
+Discord authorization code を Discord token endpoint (`https://discord.com/api/v10/oauth2/token`) で交換します。Discord application の credential は Discord の仕様に従って送信します。
 
 Discord access token は以下の確認のためだけに利用します。
 
@@ -437,15 +447,9 @@ at_hash # access token とともに発行される場合
 }
 ```
 
-追加 claim 候補:
+サポートする scope は `openid` のみです。`profile` 等の scope 由来 claim は access token を発行する flow では UserInfo endpoint から返すのが標準 semantics であり、`/userinfo` を実装しない初期実装では ID Token に profile claim を含めません。`email` claim は発行しません。Discord OAuth で `email` scope も要求しません。
 
-```text
-preferred_username
-name
-picture
-```
-
-`email` claim は発行しません。Discord OAuth で `email` scope も要求しません。
+token response が返す opaque `access_token` は UserInfo その他の protected resource には紐付けません。
 
 初期実装では Guild / role claim を発行しません。role 情報が必要な Relying Party は Discord API を直接利用します。将来 Provider claim として追加する場合は、claim namespace と情報露出範囲を別途定義します。
 
@@ -525,6 +529,8 @@ OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS  # rotation 中に公開する旧 public JWK �
 
 署名 algorithm は RS256 とし、Relying Party library との interoperability を優先します。
 
+署名は Cloudflare Workers の Web Crypto API (`crypto.subtle`) で行い、pure-Rust の RSA 実装は private key operation に使用しません（timing side-channel 対策、RUSTSEC-2023-0071 参照）。private key は PKCS#8 の RSA-2048 以上を要求します。
+
 `/jwks.json` では対応する public key のみ公開します。
 
 key rotation 時には、新しい private key で署名を開始し、旧 public key は `OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS` 経由で既発行 token の expiry がすべて過ぎるまで JWKS に残します。旧 private key は保持しません。
@@ -562,7 +568,8 @@ OIDC_CLIENT_SECRETS_JSON  # confidential client をサポートする場合
 少なくとも次を要求します。
 
 - absolute HTTPS URL
-- query / fragment を含まない
+- userinfo / query / fragment を含まない
+- path を含まない（origin のみ。`https://example.com/oidc` のような issuer は拒否する）
 - discovery document の `issuer` と ID Token の `iss` が完全一致
 - request `Host` header から issuer を推測しない
 

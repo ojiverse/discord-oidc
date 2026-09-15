@@ -144,7 +144,7 @@ OIDC_SIGNING_KEY_ID=...
     "redirect_uris": [
       "https://rp-a.ojiverse.example/auth/callback"
     ],
-    "allowed_scopes": ["openid", "profile"],
+    "allowed_scopes": ["openid"],
     "type": "public",
     "token_endpoint_auth_method": "none"
   }
@@ -176,16 +176,11 @@ exp
 nonce   # authorization request に存在する場合
 ```
 
-追加 claim として、次のような情報を提供する余地があります。
+サポートする scope は `openid` のみです。`/userinfo` を実装しないため、ID Token に Discord profile 由来の claim (`preferred_username`, `name`, `picture` 等) は含めません。
 
-```text
-preferred_username
-name
-picture
-Guild / role related claims
-```
+また、`prompt=none` / `prompt=login` / `max_age` のように再認証や authentication freshness を要求する OIDC parameter は、保証できないため常に `login_required` error で fail closed します (`prompt=consent` は Discord の consent 再承認へ対応付けます)。詳細は [docs/DESIGN.md](./docs/DESIGN.md) を参照してください。
 
-ただし、これらは表示または authorization 用の claim であり、subject identifier の代わりには使用しません。
+将来追加する claim (Guild / role related claims 等) は表示または authorization 用の claim であり、subject identifier の代わりには使用しません。
 
 ## Repository scope
 
@@ -214,6 +209,7 @@ Guild / role related claims
 
 - [設計](./docs/DESIGN.md)
 - [セキュリティ設計](./docs/SECURITY.md)
+- [Development](./docs/DEVELOPMENT.md)
 
 ## Prior art
 
