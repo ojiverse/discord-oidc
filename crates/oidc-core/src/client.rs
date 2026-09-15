@@ -15,8 +15,7 @@ pub const SUPPORTED_SCOPES: &[&str] = &["openid", "profile"];
 #[serde(rename_all = "lowercase")]
 pub enum ClientType {
     /// Public client (native app, CLI). No secret; PKCE is the protection.
-    /// Browser SPAs are out of scope: `/token` sends no CORS headers
-    /// (DESIGN §5).
+    /// Browser SPAs are out of scope: `/token` sends no CORS headers.
     Public,
     /// Confidential client. Authenticates at `/token` via `client_secret_basic`.
     Confidential,

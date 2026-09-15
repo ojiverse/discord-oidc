@@ -1,4 +1,4 @@
-//! `/authorize` handling (DESIGN §6.1).
+//! `/authorize` handling.
 //!
 //! Until `client_id` and `redirect_uri` are both validated, errors are
 //! rendered in place — never redirected. After validation, protocol errors
@@ -24,7 +24,8 @@ const MAX_PARAM_LEN: usize = 2048;
 const MAX_STATE_LEN: usize = 1024;
 
 /// Authorization request parameters this provider understands. Everything
-/// else is ignored per RFC 6749 §3.1.
+/// else is ignored — the authorization server must not fail on unrecognized
+/// request parameters (RFC 6749).
 const KNOWN_PARAMETERS: &[&str] = &[
     "response_type",
     "client_id",
@@ -125,7 +126,7 @@ fn redirect_err(
     }
 }
 
-/// Validates a raw `/authorize` query string per DESIGN §6.1.
+/// Validates a raw `/authorize` query string.
 pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict {
     if query.len() > MAX_QUERY_LEN {
         return render(400, "invalid_request", "request too large");
@@ -154,10 +155,10 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
         redirect_err(redirect_uri, code, desc, state.clone())
     };
 
-    // RFC 6749 §3.1: unrecognized request parameters are ignored. Only the
-    // known parameter set is checked for duplicates and length so that OIDC
-    // extension parameters (`prompt`, `login_hint`, `resource`, ...) sent by
-    // conforming clients do not break the flow.
+    // The authorization server must ignore unrecognized request parameters.
+    // Only the known parameter set is checked for duplicates and length so
+    // that OIDC extension parameters (`prompt`, `login_hint`, `resource`,
+    // ...) sent by conforming clients do not break the flow.
     for name in KNOWN_PARAMETERS {
         if let Some(values) = params.get(*name) {
             if values.len() > 1 {

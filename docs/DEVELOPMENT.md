@@ -38,8 +38,8 @@ is also run by the wrangler build command), and Node.js for `wrangler` itself
 
 ## Common tasks
 
-- `cargo test --workspace` — host-side test suite covering the SECURITY.md
-  §12 matrix end to end.
+- `cargo test --workspace` — host-side test suite covering the security
+  properties in `docs/SECURITY.md` end to end.
 - `cargo clippy --workspace --all-targets` and
   `cargo clippy -p discord-oidc-worker --target wasm32-unknown-unknown` —
   lint; CI denies warnings.
@@ -80,6 +80,6 @@ remain.
 ## Not implemented (out of scope for now)
 
 `/userinfo`, Dynamic Client Registration, pairwise subjects, refresh tokens,
-`email` scope, and Guild role claims — matching the non-goals in
-`docs/DESIGN.md` §12. Deploy automation is intentionally absent; CI stops at
+`email` scope, and Guild role claims — matching the documented non-goals in
+`docs/DESIGN.md`. Deploy automation is intentionally absent; CI stops at
 the packaging dry-run.

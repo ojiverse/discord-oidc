@@ -1,4 +1,4 @@
-//! `/oauth/discord/callback` handling (DESIGN §6.3).
+//! `/oauth/discord/callback` handling.
 //!
 //! Validates the provider-generated upstream `state`, exchanges the Discord
 //! code, verifies required-Guild membership, then issues a provider

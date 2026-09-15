@@ -85,7 +85,7 @@ issuer hostname はコードへ固定しません。
 OIDC_ISSUER_URL=https://discord.id.ojiverse.example
 ```
 
-`OIDC_ISSUER_URL` には任意の stable HTTPS origin を指定できます。各 endpoint は root の固定 path (`/authorize`, `/token`, `/jwks.json`, `/oauth/discord/callback`) で route されるため、path を含む issuer は受理しません（§9.3 参照）。
+`OIDC_ISSUER_URL` には任意の stable HTTPS origin を指定できます。各 endpoint は root の固定 path (`/authorize`, `/token`, `/jwks.json`, `/oauth/discord/callback`) で route されるため、path を含む issuer は受理しません。
 
 `ojiverse.example` はドキュメント用の予約ドメインです。
 

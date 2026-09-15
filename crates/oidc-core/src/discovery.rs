@@ -1,5 +1,5 @@
 //! `/.well-known/openid-configuration` metadata. Everything advertised here
-//! must match the implementation (SECURITY §10).
+//! must match the implementation — no capabilities we do not serve.
 
 use serde_json::{json, Value};
 

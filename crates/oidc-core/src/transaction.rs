@@ -1,5 +1,6 @@
 //! Authorization transaction: the internal state bridging `/authorize` and
-//! the Discord OAuth2 callback. TTL is 10 minutes (DESIGN §6.2).
+//! the Discord OAuth2 callback. TTL is 10 minutes — long enough for a user
+//! to complete the Discord login.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,4 +1,4 @@
-//! `/token` handling (DESIGN §6.5).
+//! `/token` handling.
 //!
 //! Order of checks: client authentication first (`invalid_client` -> 401 +
 //! `WWW-Authenticate`), then grant validation (`invalid_grant` -> 400) with
@@ -91,8 +91,8 @@ fn single<'a>(params: &'a Params, name: &str) -> Result<Option<&'a str>, ()> {
     }
 }
 
-/// Decodes an HTTP Basic client credential per RFC 6749 §2.3.1: the
-/// `client_id` and secret are form-url-encoded before `id:secret` is base64'd.
+/// Decodes an HTTP Basic client credential: the `client_id` and secret are
+/// each form-url-encoded before `id:secret` is base64'd.
 fn decode_basic(auth: &str) -> Option<(String, String)> {
     let encoded = auth.strip_prefix("Basic ")?;
     let decoded = base64::engine::general_purpose::STANDARD

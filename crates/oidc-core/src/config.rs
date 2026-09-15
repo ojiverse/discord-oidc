@@ -10,11 +10,13 @@ use url::Url;
 use crate::client::{build_registry, ClientRegistry, RegistryError};
 use crate::jwk::{Jwk, JwkError};
 
-/// Authorization transaction lifetime (seconds). See DESIGN §6.2.
+/// Authorization transaction lifetime (seconds): long enough for a user to
+/// complete the Discord login, short enough to bound stored state.
 pub const TRANSACTION_TTL_SECS: i64 = 600;
-/// Provider authorization code lifetime (seconds). See DESIGN §6.4.
+/// Provider authorization code lifetime (seconds): exchanged immediately by
+/// the relying party, so a short window suffices.
 pub const AUTHORIZATION_CODE_TTL_SECS: i64 = 60;
-/// Default ID Token lifetime (seconds). See DESIGN §7.1.
+/// Default ID Token lifetime (seconds).
 pub const DEFAULT_ID_TOKEN_TTL_SECS: i64 = 900;
 
 /// Raw configuration strings as read from bindings. `None` means the binding

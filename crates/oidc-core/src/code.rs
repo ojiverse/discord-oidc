@@ -1,6 +1,6 @@
 //! Provider-issued authorization code: 256-bit random, TTL 60 s, single-use,
 //! bound to client + redirect URI + PKCE challenge + authenticated subject.
-//! Only the SHA-256 hash is persisted (DESIGN §6.4).
+//! Only the SHA-256 hash is persisted.
 
 use serde::{Deserialize, Serialize};
 

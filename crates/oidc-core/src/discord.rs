@@ -1,5 +1,5 @@
 //! Discord OAuth2 / API boundary. Endpoints are fixed constants — request
-//! parameters can never steer outbound requests (SECURITY §4.12).
+//! parameters can never steer outbound requests.
 
 use serde::Deserialize;
 use url::Url;

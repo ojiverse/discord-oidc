@@ -1,5 +1,5 @@
-//! End-to-end coverage of the security properties listed in
-//! docs/SECURITY.md §12, exercised entirely on the host.
+//! End-to-end coverage of the security properties required of the provider
+//! (see docs/SECURITY.md), exercised entirely on the host.
 
 use std::collections::HashMap;
 
@@ -458,9 +458,9 @@ fn authorize_rejects_duplicate_params() {
 
 #[test]
 fn authorize_ignores_unrecognized_parameters() {
-    // RFC 6749 §3.1: unrecognized request parameters are ignored — OIDC
-    // extension params sent by conforming clients must not break the flow,
-    // even when duplicated or over-length.
+    // The authorization server must ignore unrecognized request parameters —
+    // OIDC extension params sent by conforming clients must not break the
+    // flow, even when duplicated or over-length.
     let cfg = test_config();
     let mut q = authorize_query(&[]);
     q.push_str("&prompt=consent&login_hint=u&resource=https://api.example&prompt=again");
