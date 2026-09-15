@@ -2,59 +2,62 @@
 
 ## 1. 目的
 
-`discord-oidc` は、Discord を upstream identity source として利用する community-scoped OpenID Connect Provider です。
+`discord-oidc` は、Discord OAuth2 を利用して Discord user を認証し、OpenID Connect (OIDC) の OpenID Provider (OP) として標準 OIDC interface を提供するサービスです。
 
-主目的は、各アプリケーションが Discord OAuth2 を個別実装する構成を避け、Discord community の member identity を標準 OIDC 境界へ正規化することです。
+主目的は、各 Relying Party (RP) が Discord OAuth2 と Discord 固有 API を個別実装する構成を避けることです。
 
 ```text
 Discord
-   │ OAuth2
+   │ OAuth2 / API
    ▼
 discord-oidc
+OpenID Provider
    │ OIDC
    ├──────────────┬───────────────┐
    ▼              ▼               ▼
-Client A       Client B        Client C
+RP / Client A  RP / Client B   RP / Client C
 ```
 
-この Provider は特定アプリケーション専用ではありません。
+この Provider は特定の RP 専用ではありません。
 
-**1 deployment = 1 community / identity realm** を基本とし、その deployment に複数の OIDC Client を登録します。
+**1 deployment = 1 configured Discord Guild** を基本とし、その deployment に複数の OIDC Client を登録します。
 
 ---
 
 ## 2. 設計原則
 
-### 2.1 Identity realm と Relying Party を分離する
+### 2.1 Discord Guild と Relying Party を分離する
 
-OIDC Provider の deployment unit は利用アプリケーションではなく community です。
+OpenID Provider の deployment は 1 つの Discord Guild に紐付きます。
 
-悪い例:
+RP ごとに Provider を複製しません。
+
+避ける構成:
 
 ```text
-CommunityToken 専用 Provider
-Dashboard 専用 Provider
-Wiki 専用 Provider
+RP A 専用 Provider
+RP B 専用 Provider
+RP C 専用 Provider
 ```
 
-推奨:
+推奨構成:
 
 ```text
-1 Discord community
+1 Discord Guild
       │
       ▼
-1 OIDC issuer
+1 OpenID Provider / issuer
       │
-      ├ CommunityToken
-      ├ Dashboard
-      └ Wiki
+      ├ RP / Client A
+      ├ RP / Client B
+      └ RP / Client C
 ```
 
-同じ Discord user はすべての client で同じ `(iss, sub)` を持ち、`aud` のみ client ごとに変化します。
+同じ Discord user は、public subject を採用している限りすべての OIDC Client で同じ `(iss, sub)` を持ち、`aud` は Client ごとに変化します。
 
-### 2.2 Canonical identity は `(iss, sub)`
+### 2.2 Canonical external identity は `(iss, sub)`
 
-Relying Party が永続 identity として利用する値は次の組です。
+Relying Party が外部主体を永続的に識別する値は次の組です。
 
 ```text
 issuer  = ID Token `iss`
@@ -63,7 +66,7 @@ subject = ID Token `sub`
 
 Discord-backed issuer では `sub` に stable Discord user ID (Snowflake) を使用します。
 
-次の値は canonical identity として使用しません。
+次の値は subject identifier として使用しません。
 
 - email
 - username
@@ -72,7 +75,7 @@ Discord-backed issuer では `sub` に stable Discord user ID (Snowflake) を使
 - Guild role
 - Guild nickname
 
-これらは変更可能、非一意、または authorization/context に属する情報です。
+これらは変更可能、非一意、または authorization 用の属性です。
 
 ### 2.3 Issuer URL は deployment configuration
 
@@ -86,22 +89,22 @@ OIDC_ISSUER_URL=https://discord.id.ojiverse.example
 
 `ojiverse.example` はドキュメント用の予約ドメインです。
 
-一度 production identity binding に利用した issuer URL は長期的な identity namespace として扱います。hostname の変更は cosmetic change ではなく identity migration です。
+一度 production の `(iss, sub)` に利用した issuer URL は長期的な issuer identifier として扱います。hostname の変更は cosmetic change ではなく external identity migration です。
 
-### 2.4 Cloudflare は runtime、OIDC は contract
+### 2.4 Cloudflare は runtime、OIDC は protocol contract
 
 実装は Cloudflare 上で動かしますが、Relying Party との契約は標準 OIDC over HTTPS です。
 
-同一 Cloudflare Account 上に client service が存在しても、以下へ依存させません。
+同一 Cloudflare Account 上に RP が存在しても、以下へ依存させません。
 
-- Service Binding を認証契約として利用すること
+- Service Binding を OIDC authentication の契約として利用すること
 - shared Durable Object
 - shared database
 - shared secret による implicit trust
 
 ---
 
-## 3. Community admission policy
+## 3. Discord Guild membership requirement
 
 各 deployment には対象 Discord Guild を 1 つ設定します。
 
@@ -112,10 +115,10 @@ DISCORD_REQUIRED_GUILD_ID=123456789012345678
 OIDC authentication を完了するには、Discord OAuth2 で認証された user がこの Guild の member である必要があります。
 
 ```text
-Discord authentication
+Discord OAuth2 authentication
         │
         ▼
-Discord user identity
+Discord user
         │
         ▼
 required Guild membership check
@@ -127,9 +130,7 @@ required Guild membership check
  continue      deny
 ```
 
-Guild membership は issuer への admission condition です。
-
-Guild role は canonical identity ではありません。必要であれば追加 claim として提供できますが、role change により `sub` が変化してはいけません。
+Guild role は `sub` を構成しません。必要であれば追加 claim として提供できますが、role change によって `sub` が変化してはいけません。
 
 ### 3.1 Guild membership verification
 
@@ -140,11 +141,11 @@ identify
 guilds
 ```
 
-`GET /users/@me` で user identity を取得し、`GET /users/@me/guilds` の結果から required Guild membership を検証します。
+`GET /users/@me` で Discord user を取得し、`GET /users/@me/guilds` の結果から required Guild membership を検証します。
 
-Guild 一覧 API が pagination を持つ場合、途中までの結果だけで「所属していない」と判定してはいけません。required Guild が見つかるか、結果を最後まで検証する必要があります。
+Guild 一覧 API が pagination を持つ場合、途中までの結果だけで non-member と判定してはいけません。required Guild が見つかるか、結果を最後まで検証する必要があります。
 
-role claim 等で Bot API が必要になった場合は別途 Bot Token を導入できますが、基本 identity flow のために Bot を必須にはしません。
+role claim 等で Bot API が必要になった場合は別途 Bot Token を導入できますが、基本的な authentication flow のために Bot を必須にはしません。
 
 ---
 
@@ -154,7 +155,7 @@ role claim 等で Bot API が必要になった場合は別途 Bot Token を導�
 
 初期実装では Dynamic Client Registration を実装しません。
 
-少数の trusted client を明示的に設定します。
+少数の trusted OIDC Client を明示的に設定します。
 
 概念例:
 
@@ -252,7 +253,7 @@ GET /userinfo
 - `claims_supported`
 - PKCE capability
 
-実際の公開値は実装された機能と一致している必要があります。
+公開 metadata は実装された機能と一致している必要があります。
 
 ---
 
@@ -290,7 +291,7 @@ Provider は最初に以下を検証します。
 
 Discord 向けに Provider 自身の OAuth `state` を生成します。
 
-この state は Relying Party が与えた `state` と同一値をそのまま upstream へ横流しするものではありません。
+この state は Relying Party が `/authorize` に渡した `state` と同一値をそのまま Discord へ横流しするものではありません。
 
 内部 transaction には概ね以下を保持します。
 
@@ -308,7 +309,7 @@ authorization_transaction
 └ expires_at
 ```
 
-Discord callback では Provider が生成した upstream `state` を照合します。
+Discord callback では Provider が生成した `discord_oauth_state` を照合します。
 
 ### 6.3 Discord callback
 
@@ -320,7 +321,7 @@ Discord access token は以下の確認のためだけに利用します。
 - required Guild membership
 - 必要な追加 claim
 
-認証に不要な Discord access / refresh token を長期保存しません。
+OIDC authentication に不要な Discord access / refresh token を長期保存しません。
 
 検証成功後、Provider 自身の authorization code を新規発行します。
 
@@ -476,7 +477,7 @@ access_tokens (userinfo を実装する場合)
 
 長期 user database は持ちません。
 
-Discord user profile を identity database として複製することも目的ではありません。
+Discord user profile を user directory として複製することも目的ではありません。
 
 ### 8.3 Signing keys
 
@@ -582,10 +583,10 @@ CI/CD credential は可能な範囲で repository ごとに scope を分離し�
 
 同プロジェクトの「Discord OAuth2 を Cloudflare Worker 上で OIDC として公開する」というアプローチを参考にしつつ、本プロジェクトでは以下を明示的に設計目標とします。
 
-- Cloudflare Access 専用ではない OIDC Provider
+- Cloudflare Access 専用ではない OpenID Provider
 - stable configurable issuer
-- standard `(iss, sub)` identity
-- community / Guild scoped deployment
+- standard `(iss, sub)` subject identification
+- single Discord Guild per deployment
 - one issuer / multiple OIDC clients
 - client-specific `aud`
 - Provider 自身の authorization code lifecycle
