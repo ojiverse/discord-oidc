@@ -162,16 +162,16 @@ role claim 等で Bot API が必要になった場合は別途 Bot Token を導�
 ```json
 [
   {
-    "client_id": "communitytoken-client-id",
+    "client_id": "rp-a-client-id",
     "redirect_uris": [
-      "https://communitytoken.ojiverse.example/auth/callback"
+      "https://rp-a.ojiverse.example/auth/callback"
     ],
     "type": "public"
   },
   {
-    "client_id": "server-side-service",
+    "client_id": "rp-b-client-id",
     "redirect_uris": [
-      "https://service.ojiverse.example/oidc/callback"
+      "https://rp-b.ojiverse.example/oidc/callback"
     ],
     "type": "confidential"
   }
@@ -206,12 +206,12 @@ confidential client secret は通常の環境変数ではなく Cloudflare Worke
 Client A:
   iss = https://discord.id.ojiverse.example
   sub = 123456789012345678
-  aud = client-a
+  aud = rp-a-client-id
 
 Client B:
   iss = https://discord.id.ojiverse.example
   sub = 123456789012345678
-  aud = client-b
+  aud = rp-b-client-id
 ```
 
 初期実装では public subject を採用します。pairwise subject が必要になった場合は別途設計します。
@@ -404,7 +404,7 @@ nonce   # authorization request に存在する場合
 {
   "iss": "https://discord.id.ojiverse.example",
   "sub": "123456789012345678",
-  "aud": "communitytoken-client-id",
+  "aud": "rp-a-client-id",
   "iat": 1770000000,
   "exp": 1770000600,
   "nonce": "..."
