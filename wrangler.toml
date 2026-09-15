@@ -10,7 +10,8 @@ command = "cargo install -q worker-build && worker-build --release crates/discor
 OIDC_ISSUER_URL = "https://discord-oidc.ojiverse.workers.dev"
 DISCORD_CLIENT_ID = "1549449390509392013"
 DISCORD_REQUIRED_GUILD_ID = "577577973159559219"
-OIDC_CLIENTS_JSON = "[]"
+# Post-deploy verification client. Public + PKCE; localhost redirect only.
+OIDC_CLIENTS_JSON = '[{"client_id":"local-dev","redirect_uris":["http://localhost:8788/callback"],"allowed_scopes":["openid"],"type":"public","token_endpoint_auth_method":"none"}]'
 OIDC_SIGNING_KEY_ID = "prod-key-1"
 # OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS = "[]"
 # OIDC_ID_TOKEN_TTL_SECONDS = "900"
