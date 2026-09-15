@@ -20,12 +20,12 @@ and `docs/SECURITY.md` in Rust on Cloudflare Workers (workers-rs).
   constant-time native code.
 - `wrangler.toml` — Worker manifest: custom build, public vars, Durable
   Object binding, and the SQLite-class migration.
-- `.github/workflows/ci.yml` — format, lint, host tests, `cargo audit`
+- `.github/workflows/test.yaml` — format, lint, host tests, `cargo audit`
   (RustSec advisories), wasm build, and a wrangler packaging dry-run.
   Actions are pinned to commit SHAs; `worker-build`, `wrangler`, and
   `cargo-audit` are version-pinned.
-- `.github/workflows/cd.yml` — production deploy. Runs when a `ci` run on
-  `main` completes successfully (`workflow_run`), or manually via
+- `.github/workflows/deploy.yaml` — production deploy. Runs when a `test`
+  run on `main` completes successfully (`workflow_run`), or manually via
   `workflow_dispatch`. See "Deployment" below.
 
 The boundary between the crates is the point of the design: everything an
@@ -82,8 +82,8 @@ remain.
 
 ## Deployment
 
-`.github/workflows/cd.yml` deploys to production. It triggers on a
-successful `ci` run on `main` (`workflow_run`, deploying the exact commit
+`.github/workflows/deploy.yaml` deploys to production. It triggers on a
+successful `test` run on `main` (`workflow_run`, deploying the exact commit
 CI validated) and on `workflow_dispatch` for manual deploys. The job uses
 the `production` GitHub environment and runs serially — an in-flight deploy
 is never cancelled.
@@ -114,7 +114,7 @@ One-time setup, none of which lives in the repository:
   integrations → GitHub Actions, which yields `OP_INTEGRATION_KEY` (kept as
   a GitHub organization secret). The `discord-oidc-prod` Environment holds
   the variables above and its GitHub Actions destination is restricted to
-  this repository's `cd.yml` on `main`. `OP_WORKLOAD_ID` and
+  this repository's `deploy.yaml` on `main`. `OP_WORKLOAD_ID` and
   `OP_ENVIRONMENT_ID` are repo variables.
 - GitHub: create the `production` environment, optionally with required
   reviewers.

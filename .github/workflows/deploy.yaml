@@ -1,16 +1,16 @@
-name: cd
+name: deploy
 
 on:
-  # Deploy only after a green ci run on main.
+  # Deploy only after a green test run on main.
   workflow_run:
-    workflows: [ci]
+    workflows: [test]
     types: [completed]
     branches: [main]
   workflow_dispatch:
 
 concurrency:
   # Never cancel a deploy halfway; runs queue instead.
-  group: cd-production
+  group: deploy-production
   cancel-in-progress: false
 
 env:
@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Deploy the exact commit ci validated, not the merge ref.
+          # Deploy the exact commit test validated, not the merge ref.
           ref: >-
             ${{
               github.event_name == 'workflow_run' &&
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-      # Same pin as ci.yml; wrangler's [build] command also installs
+      # Same pin as test.yaml; wrangler's [build] command also installs
       # worker-build, this keeps the version deterministic.
       - run: cargo install worker-build --locked --version 0.8.5
 
