@@ -16,8 +16,11 @@ command = "cargo install -q worker-build && worker-build --release crates/discor
 OIDC_ISSUER_URL = "https://discord.id.ojiver.se"
 DISCORD_CLIENT_ID = "1549449390509392013"
 DISCORD_REQUIRED_GUILD_ID = "577577973159559219"
-# Post-deploy verification client. Public + PKCE; localhost redirect only.
-OIDC_CLIENTS_JSON = '[{"client_id":"local-dev","redirect_uris":["http://localhost:8788/callback"],"allowed_scopes":["openid"],"type":"public","token_endpoint_auth_method":"none"}]'
+# local-dev: post-deploy verification client (public + PKCE, localhost only).
+# cloudflare-access: Cloudflare Zero Trust generic OIDC IdP for the OJIverse
+# account (confidential, client_secret_basic). Its secret lives in
+# OIDC_CLIENT_SECRETS_JSON; without that entry the registry fails validation.
+OIDC_CLIENTS_JSON = '[{"client_id":"local-dev","redirect_uris":["http://localhost:8788/callback"],"allowed_scopes":["openid"],"type":"public","token_endpoint_auth_method":"none"},{"client_id":"cloudflare-access","redirect_uris":["https://ojiverse.cloudflareaccess.com/cdn-cgi/access/callback"],"allowed_scopes":["openid"],"type":"confidential","token_endpoint_auth_method":"client_secret_basic"}]'
 OIDC_SIGNING_KEY_ID = "prod-key-1"
 # OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS = "[]"
 # OIDC_ID_TOKEN_TTL_SECONDS = "900"
