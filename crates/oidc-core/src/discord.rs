@@ -16,14 +16,21 @@ pub const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 pub const DISCORD_SCOPES: &str = "identify guilds.members.read";
 
 /// Builds the Discord authorization redirect for an in-flight transaction.
-pub fn discord_authorize_url(cfg: &Config, discord_oauth_state: &str) -> String {
+/// `consent` forwards the RP's `prompt=consent` as Discord's own consent
+/// re-approval prompt — it is not a reauthentication guarantee.
+pub fn discord_authorize_url(cfg: &Config, discord_oauth_state: &str, consent: bool) -> String {
     let mut url = Url::parse(DISCORD_AUTHORIZE_URL).expect("constant URL");
-    url.query_pairs_mut()
+    let mut pairs = url.query_pairs_mut();
+    pairs
         .append_pair("client_id", &cfg.discord_client_id)
         .append_pair("redirect_uri", &cfg.discord_callback_url())
         .append_pair("response_type", "code")
         .append_pair("scope", DISCORD_SCOPES)
         .append_pair("state", discord_oauth_state);
+    if consent {
+        pairs.append_pair("prompt", "consent");
+    }
+    drop(pairs);
     url.into()
 }
 
@@ -35,29 +42,12 @@ pub struct DiscordTokenResponse {
     pub access_token: String,
 }
 
-/// Discord `GET /users/@me` fields we consume.
+/// Discord `GET /users/@me` fields we consume. Only the stable snowflake is
+/// used for `sub`; Discord profile fields are never mapped into tokens.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiscordUser {
     /// Stable user snowflake -> `sub`.
     pub id: String,
-    /// Discord username -> `preferred_username` (profile scope).
-    pub username: Option<String>,
-    /// Display name -> `name` (profile scope).
-    pub global_name: Option<String>,
-    /// Avatar hash -> `picture` (profile scope).
-    pub avatar: Option<String>,
-}
-
-impl DiscordUser {
-    /// CDN avatar URL, if the user has a custom avatar.
-    pub fn avatar_url(&self) -> Option<String> {
-        self.avatar.as_ref().map(|hash| {
-            format!(
-                "https://cdn.discordapp.com/avatars/{}/{}.png",
-                self.id, hash
-            )
-        })
-    }
 }
 
 /// Discord `GET /users/@me/guilds/{id}/member` response. Presence is what

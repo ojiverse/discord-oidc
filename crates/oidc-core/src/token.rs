@@ -232,10 +232,6 @@ pub async fn handle_token<S: AuthorizationStore, E: Entropy, G: IdTokenSigner>(
     };
 
     let access_token = random_token(entropy);
-    let profile = record
-        .profile
-        .as_ref()
-        .filter(|_| record.scope.split_whitespace().any(|s| s == "profile"));
     let claims = IdTokenClaims {
         iss: cfg.issuer.clone(),
         sub: record.subject.clone(),
@@ -244,9 +240,6 @@ pub async fn handle_token<S: AuthorizationStore, E: Entropy, G: IdTokenSigner>(
         exp: now + cfg.id_token_ttl_secs,
         nonce: record.nonce.clone(),
         at_hash: Some(at_hash(&access_token)),
-        preferred_username: profile.and_then(|p| p.preferred_username.clone()),
-        name: profile.and_then(|p| p.name.clone()),
-        picture: profile.and_then(|p| p.picture.clone()),
     };
     let id_token = match encode_claims(signer, &claims).await {
         Ok(t) => t,

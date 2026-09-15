@@ -22,7 +22,6 @@ pub fn discovery_document(cfg: &Config) -> Value {
         "scopes_supported": SUPPORTED_SCOPES,
         "claims_supported": [
             "iss", "sub", "aud", "iat", "exp", "nonce", "at_hash",
-            "preferred_username", "name", "picture",
         ],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "none"],
         "code_challenge_methods_supported": ["S256"],

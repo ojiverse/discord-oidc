@@ -7,7 +7,7 @@
 use url::form_urlencoded;
 
 use crate::authorize::redirect_with_params;
-use crate::code::{issue_code, ProfileClaims};
+use crate::code::issue_code;
 use crate::config::Config;
 use crate::discord::DiscordApi;
 use crate::error::{error_page, OAuthErrorCode};
@@ -163,14 +163,7 @@ pub async fn handle_callback<S: AuthorizationStore, D: DiscordApi, E: Entropy>(
         }
     }
 
-    let profile = Some(ProfileClaims {
-        preferred_username: user.username.clone(),
-        name: user.global_name.clone(),
-        picture: user.avatar_url(),
-    })
-    .filter(|p| p.preferred_username.is_some() || p.name.is_some() || p.picture.is_some());
-
-    let issued = issue_code(&tx, user.id, profile, entropy, now);
+    let issued = issue_code(&tx, user.id, entropy, now);
     if store.put_authorization_code(&issued.record).await.is_err() {
         return redirect_error(
             &tx,

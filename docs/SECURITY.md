@@ -479,8 +479,11 @@ security-sensitive dependency は lockfile で固定し、Renovate / Dependabot 
 - unknown client rejection
 - exact redirect URI matching
 - missing `openid` scope
+- scope outside the client allowlist
 - invalid response type
 - invalid/missing PKCE
+- unrecognized parameters ignored
+- `prompt` / `max_age` fail-closed behavior
 
 ### Discord callback
 

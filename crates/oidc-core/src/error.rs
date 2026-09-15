@@ -27,6 +27,12 @@ pub enum OAuthErrorCode {
     ServerError,
     /// RFC 6749 `temporarily_unavailable`.
     TemporarilyUnavailable,
+    /// OIDC `login_required` — interactive authentication is required but
+    /// cannot be guaranteed by this provider.
+    LoginRequired,
+    /// OIDC `account_selection_required` — the RP asked for account
+    /// selection the provider cannot perform.
+    AccountSelectionRequired,
 }
 
 impl OAuthErrorCode {
@@ -43,6 +49,8 @@ impl OAuthErrorCode {
             Self::AccessDenied => "access_denied",
             Self::ServerError => "server_error",
             Self::TemporarilyUnavailable => "temporarily_unavailable",
+            Self::LoginRequired => "login_required",
+            Self::AccountSelectionRequired => "account_selection_required",
         }
     }
 }

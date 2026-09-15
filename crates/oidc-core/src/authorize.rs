@@ -25,7 +25,8 @@ const MAX_STATE_LEN: usize = 1024;
 
 /// Authorization request parameters this provider understands. Everything
 /// else is ignored — the authorization server must not fail on unrecognized
-/// request parameters (RFC 6749).
+/// request parameters (RFC 6749). OIDC-defined `prompt`/`max_age` are known
+/// parameters with explicit fail-closed semantics below.
 const KNOWN_PARAMETERS: &[&str] = &[
     "response_type",
     "client_id",
@@ -35,6 +36,8 @@ const KNOWN_PARAMETERS: &[&str] = &[
     "nonce",
     "code_challenge",
     "code_challenge_method",
+    "prompt",
+    "max_age",
 ];
 
 /// A validated authorization request.
@@ -52,6 +55,9 @@ pub struct ValidatedAuthorize {
     pub nonce: Option<String>,
     /// PKCE S256 challenge.
     pub code_challenge: String,
+    /// The RP asked for `prompt=consent`; forwarded to Discord's own
+    /// consent re-approval prompt on the authorization redirect.
+    pub discord_consent: bool,
 }
 
 /// The outcome of validating an `/authorize` request.
@@ -157,8 +163,8 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
 
     // The authorization server must ignore unrecognized request parameters.
     // Only the known parameter set is checked for duplicates and length so
-    // that OIDC extension parameters (`prompt`, `login_hint`, `resource`,
-    // ...) sent by conforming clients do not break the flow.
+    // that OIDC extension parameters (`login_hint`, `resource`, ...) sent by
+    // conforming clients do not break the flow.
     for name in KNOWN_PARAMETERS {
         if let Some(values) = params.get(*name) {
             if values.len() > 1 {
@@ -218,6 +224,57 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
         return err(OAuthErrorCode::InvalidRequest, "state too long");
     }
 
+    // `prompt` is a space-delimited list of OIDC authentication request
+    // values. Values this provider cannot satisfy fail closed with an OIDC
+    // error rather than being silently ignored; unrecognized values are
+    // ignored so extension values do not break conforming clients.
+    let prompt: Vec<&str> = single(&params, "prompt")
+        .ok()
+        .flatten()
+        .map(|p| p.split_whitespace().collect())
+        .unwrap_or_default();
+    let mut discord_consent = false;
+    if !prompt.is_empty() {
+        // `none` must not be combined with any other value.
+        if prompt.contains(&"none") && prompt.len() > 1 {
+            return err(
+                OAuthErrorCode::InvalidRequest,
+                "prompt=none must not be combined with other values",
+            );
+        }
+        // No provider-side session exists and Discord exposes no verified
+        // upstream authentication time, so silent authentication (`none`)
+        // and guaranteed reauthentication (`login`) are unsatisfiable.
+        // Discord's `prompt=consent` only re-prompts authorization consent
+        // and is never a substitute for reauthentication.
+        if prompt.contains(&"none") || prompt.contains(&"login") {
+            return err(
+                OAuthErrorCode::LoginRequired,
+                "interactive authentication cannot be guaranteed",
+            );
+        }
+        if prompt.contains(&"select_account") {
+            return err(
+                OAuthErrorCode::AccountSelectionRequired,
+                "account selection is not supported",
+            );
+        }
+        if prompt.contains(&"consent") {
+            discord_consent = true;
+        }
+    }
+
+    // `max_age` demands proof that the upstream authentication is recent
+    // enough. Discord provides no trustworthy authentication timestamp and
+    // no guaranteed reauthentication hook, so any `max_age` request fails
+    // closed — never fabricate `auth_time` from the callback arrival time.
+    if let Some(max_age) = single(&params, "max_age").ok().flatten() {
+        if max_age.parse::<u64>().is_err() {
+            return err(OAuthErrorCode::InvalidRequest, "invalid max_age");
+        }
+        return err(OAuthErrorCode::LoginRequired, "max_age cannot be satisfied");
+    }
+
     AuthorizeVerdict::Proceed(ValidatedAuthorize {
         client_id: client.client_id.clone(),
         redirect_uri: redirect_uri.to_string(),
@@ -225,6 +282,7 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
         rp_state: state,
         nonce,
         code_challenge,
+        discord_consent,
     })
 }
 
@@ -292,6 +350,7 @@ pub async fn handle_authorize<S: AuthorizationStore, E: Entropy>(
             CoreResponse::Redirect(crate::discord::discord_authorize_url(
                 cfg,
                 &tx.discord_oauth_state,
+                v.discord_consent,
             ))
         }
     }

@@ -83,3 +83,27 @@ remain.
 `email` scope, and Guild role claims — matching the documented non-goals in
 `docs/DESIGN.md`. Deploy automation is intentionally absent; CI stops at
 the packaging dry-run.
+
+Only the `openid` scope is supported. The opaque `access_token` returned by
+`/token` is not bound to UserInfo or any other protected resource. OIDC
+`prompt`/`max_age` values this provider cannot satisfy (`none`, `login`,
+`select_account`, any `max_age`) fail closed with `login_required` /
+`account_selection_required`; `prompt=consent` is forwarded to Discord's
+consent re-approval prompt.
+
+## Pre-production smoke test
+
+Web Crypto signing and the live Discord OAuth exchange cannot be fully
+verified on the host. Before production use, run this checklist against a
+preview/staging Worker with a test Discord application:
+
+- `/.well-known/openid-configuration` issuer/endpoints match the real URL
+- `/jwks.json` publishes the JWK corresponding to the signing key
+- `scope=openid` Authorization Code Flow completes end to end
+- the issued ID Token verifies as RS256 against JWKS, with expected `iss`,
+  `sub`, client-specific `aud`, `nonce`, `iat`, `exp`
+- a required-Guild member succeeds; a non-member fails closed
+- a wrong PKCE verifier returns `invalid_grant`; code replay fails
+- `prompt=none`, `prompt=login`, and `max_age` return `login_required`
+  without reaching Discord or issuing tokens
+- `prompt=consent` adds `prompt=consent` to the Discord authorize URL

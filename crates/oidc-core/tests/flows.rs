@@ -95,7 +95,7 @@ fn test_config() -> Config {
         {
             "client_id": PUBLIC_CLIENT,
             "redirect_uris": [PUBLIC_REDIRECT],
-            "allowed_scopes": ["openid", "profile"],
+            "allowed_scopes": ["openid"],
             "type": "public",
             "token_endpoint_auth_method": "none",
         },
@@ -133,7 +133,7 @@ fn authorize_query(overrides: &[(&str, Option<&str>)]) -> String {
         ("response_type", "code"),
         ("client_id", PUBLIC_CLIENT),
         ("redirect_uri", PUBLIC_REDIRECT),
-        ("scope", "openid profile"),
+        ("scope", "openid"),
         ("state", "rp-state-123"),
         ("nonce", "nonce-abc"),
         ("code_challenge_method", "S256"),
@@ -189,9 +189,6 @@ impl Default for MockDiscord {
             exchange_status: None,
             user: Some(DiscordUser {
                 id: DISCORD_USER_ID.to_string(),
-                username: Some("tester".to_string()),
-                global_name: Some("Test User".to_string()),
-                avatar: Some("abc123".to_string()),
             }),
             member_status: 200,
         }
@@ -376,12 +373,16 @@ fn authorize_rejects_missing_openid_scope() {
 #[test]
 fn authorize_rejects_scope_outside_allowlist() {
     let cfg = test_config();
-    let q = authorize_query(&[("scope", Some("openid email"))]);
-    match validate_authorize_request(&q, &cfg) {
-        AuthorizeVerdict::RedirectError { code, .. } => {
-            assert_eq!(code, OAuthErrorCode::InvalidScope)
+    // `profile` is also rejected: only `openid` is supported and the
+    // client's `allowed_scopes` cannot contain it.
+    for scope in ["openid email", "openid profile"] {
+        let q = authorize_query(&[("scope", Some(scope))]);
+        match validate_authorize_request(&q, &cfg) {
+            AuthorizeVerdict::RedirectError { code, .. } => {
+                assert_eq!(code, OAuthErrorCode::InvalidScope, "scope: {scope}")
+            }
+            other => panic!("expected redirect invalid_scope for {scope}, got {other:?}"),
         }
-        other => panic!("expected redirect invalid_scope, got {other:?}"),
     }
 }
 
@@ -463,10 +464,116 @@ fn authorize_ignores_unrecognized_parameters() {
     // flow, even when duplicated or over-length.
     let cfg = test_config();
     let mut q = authorize_query(&[]);
-    q.push_str("&prompt=consent&login_hint=u&resource=https://api.example&prompt=again");
+    q.push_str("&login_hint=u&resource=https://api.example&login_hint=again");
     match validate_authorize_request(&q, &cfg) {
         AuthorizeVerdict::Proceed(_) => {}
         other => panic!("expected proceed, got {other:?}"),
+    }
+}
+
+// `prompt` and `max_age` are OIDC-defined known parameters, not ignorable
+// extensions. This provider has no session and no verified upstream
+// authentication time, so every unsatisfiable value fails closed with an
+// OIDC error to the registered redirect_uri (state preserved) and never
+// reaches Discord.
+
+fn expect_redirect_error(q: &str, cfg: &Config, code: OAuthErrorCode) {
+    match validate_authorize_request(q, cfg) {
+        AuthorizeVerdict::RedirectError {
+            redirect_uri,
+            code: c,
+            state,
+            ..
+        } => {
+            assert_eq!(redirect_uri, PUBLIC_REDIRECT);
+            assert_eq!(c, code);
+            assert_eq!(state.as_deref(), Some("rp-state-123"));
+        }
+        other => panic!("expected redirect {code:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn authorize_prompt_none_fails_closed() {
+    let cfg = test_config();
+    let store = InMemoryStore::new();
+    let q = authorize_query(&[("prompt", Some("none"))]);
+    expect_redirect_error(&q, &cfg, OAuthErrorCode::LoginRequired);
+    // No transaction is created and nothing redirects to Discord.
+    let resp = block_on(handle_authorize(&q, &cfg, &store, &mut entropy(), NOW));
+    let loc = location_of(&resp);
+    assert!(loc.starts_with(PUBLIC_REDIRECT));
+    let p = query_params(&loc);
+    assert_eq!(p["error"], "login_required");
+    assert_eq!(p["state"], "rp-state-123");
+    assert_eq!(store.transaction_count(), 0);
+}
+
+#[test]
+fn authorize_prompt_login_fails_closed() {
+    // `prompt=login` demands reauthentication; Discord's `prompt=consent`
+    // only re-approves authorization and must not substitute for it.
+    let cfg = test_config();
+    let q = authorize_query(&[("prompt", Some("login"))]);
+    expect_redirect_error(&q, &cfg, OAuthErrorCode::LoginRequired);
+}
+
+#[test]
+fn authorize_prompt_select_account_fails_closed() {
+    let cfg = test_config();
+    let q = authorize_query(&[("prompt", Some("select_account"))]);
+    expect_redirect_error(&q, &cfg, OAuthErrorCode::AccountSelectionRequired);
+}
+
+#[test]
+fn authorize_prompt_none_combined_is_invalid() {
+    let cfg = test_config();
+    for prompt in ["none login", "none consent", "consent none"] {
+        let q = authorize_query(&[("prompt", Some(prompt))]);
+        expect_redirect_error(&q, &cfg, OAuthErrorCode::InvalidRequest);
+    }
+}
+
+#[test]
+fn authorize_prompt_consent_forwards_to_discord() {
+    let cfg = test_config();
+    let store = InMemoryStore::new();
+    let q = authorize_query(&[("prompt", Some("consent"))]);
+    let resp = block_on(handle_authorize(&q, &cfg, &store, &mut entropy(), NOW));
+    let loc = location_of(&resp);
+    assert!(loc.starts_with("https://discord.com/oauth2/authorize?"));
+    assert_eq!(query_params(&loc)["prompt"], "consent");
+}
+
+#[test]
+fn authorize_prompt_unknown_values_ignored() {
+    let cfg = test_config();
+    for prompt in ["create", "consent create"] {
+        let q = authorize_query(&[("prompt", Some(prompt))]);
+        match validate_authorize_request(&q, &cfg) {
+            AuthorizeVerdict::Proceed(_) => {}
+            other => panic!("expected proceed for prompt={prompt}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn authorize_max_age_fails_closed() {
+    // Any satisfiable-looking `max_age` (including 0) cannot be honored
+    // without a verified upstream authentication time.
+    let cfg = test_config();
+    for max_age in ["0", "300"] {
+        let q = authorize_query(&[("max_age", Some(max_age))]);
+        expect_redirect_error(&q, &cfg, OAuthErrorCode::LoginRequired);
+    }
+}
+
+#[test]
+fn authorize_max_age_malformed_is_invalid() {
+    let cfg = test_config();
+    for max_age in ["-1", "abc", "1.5", ""] {
+        let q = authorize_query(&[("max_age", Some(max_age))]);
+        expect_redirect_error(&q, &cfg, OAuthErrorCode::InvalidRequest);
     }
 }
 
@@ -494,7 +601,7 @@ fn callback_rejects_unknown_state() {
 fn callback_forwards_discord_error_with_rp_state() {
     let cfg = test_config();
     let store = InMemoryStore::new();
-    let tx = block_on(seed_transaction(&store, "openid profile"));
+    let tx = block_on(seed_transaction(&store, "openid"));
     let resp = block_on(handle_callback(
         &format!("error=access_denied&state={}", tx.discord_oauth_state),
         &cfg,
@@ -566,9 +673,6 @@ fn callback_rejects_malformed_user_id() {
     let discord = MockDiscord {
         user: Some(DiscordUser {
             id: "not-a-snowflake".to_string(),
-            username: None,
-            global_name: None,
-            avatar: None,
         }),
         ..Default::default()
     };
@@ -629,7 +733,7 @@ fn callback_guild_api_failure_fails_closed() {
 fn callback_success_issues_bound_code() {
     let cfg = test_config();
     let store = InMemoryStore::new();
-    let tx = block_on(seed_transaction(&store, "openid profile"));
+    let tx = block_on(seed_transaction(&store, "openid"));
     let resp = block_on(handle_callback(
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
@@ -673,7 +777,7 @@ fn token_full_flow_issues_valid_id_token() {
         &store,
         PUBLIC_CLIENT,
         PUBLIC_REDIRECT,
-        "openid profile",
+        "openid",
     ));
     let body = token_body(&[("code", Some(&code))]);
     let resp = block_on(handle_token(
@@ -698,7 +802,7 @@ fn token_full_flow_issues_valid_id_token() {
     assert!(no_store);
     assert_eq!(json["token_type"], "Bearer");
     assert_eq!(json["expires_in"], 900);
-    assert_eq!(json["scope"], "openid profile");
+    assert_eq!(json["scope"], "openid");
     assert_eq!(json["access_token"].as_str().unwrap().len(), 43);
 
     let id_token = json["id_token"].as_str().unwrap();
@@ -711,12 +815,10 @@ fn token_full_flow_issues_valid_id_token() {
     assert_eq!(claims["iat"], NOW);
     assert_eq!(claims["exp"], NOW + 900);
     assert_eq!(claims["nonce"], "nonce-abc");
-    assert_eq!(claims["preferred_username"], "tester");
-    assert_eq!(claims["name"], "Test User");
-    assert!(claims["picture"]
-        .as_str()
-        .unwrap()
-        .starts_with("https://cdn.discordapp.com/avatars/"));
+    // Only `openid` exists; Discord profile fields never become claims.
+    for field in ["preferred_username", "name", "picture", "auth_time"] {
+        assert!(claims.get(field).is_none(), "unexpected claim {field}");
+    }
     let digest = Sha256::digest(json["access_token"].as_str().unwrap().as_bytes());
     let expected_ath = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..16]);
     assert_eq!(claims["at_hash"], expected_ath);
@@ -997,7 +1099,7 @@ fn token_confidential_full_flow() {
     assert_eq!(status, 200);
     let (_, claims, _, _) = decode_jwt(json["id_token"].as_str().unwrap());
     assert_eq!(claims["aud"], CONF_CLIENT);
-    // No profile scope granted -> no profile claims.
+    // Only `openid` exists -> no profile claims are ever emitted.
     assert!(claims.get("preferred_username").is_none());
     assert!(claims.get("picture").is_none());
 }
@@ -1197,9 +1299,6 @@ fn rotation_overlap_keeps_old_tokens_verifiable() {
         exp: NOW + 900,
         nonce: None,
         at_hash: None,
-        preferred_username: None,
-        name: None,
-        picture: None,
     };
     let token = block_on(encode_claims(&old_signer, &claims)).unwrap();
 
@@ -1241,6 +1340,13 @@ fn discovery_matches_implementation() {
     assert_eq!(
         doc["token_endpoint_auth_methods_supported"],
         json!(["client_secret_basic", "none"])
+    );
+    // Only `openid` is supported and only claims the token endpoint can
+    // actually emit are advertised.
+    assert_eq!(doc["scopes_supported"], json!(["openid"]));
+    assert_eq!(
+        doc["claims_supported"],
+        json!(["iss", "sub", "aud", "iat", "exp", "nonce", "at_hash"])
     );
     // /userinfo is not implemented -> not advertised.
     assert!(doc.get("userinfo_endpoint").is_none());
@@ -1366,8 +1472,7 @@ fn consume_reports_deny_kinds() {
         &mut entropy(),
         NOW,
     );
-    let issued =
-        oidc_core::code::issue_code(&tx, DISCORD_USER_ID.to_string(), None, &mut entropy(), NOW);
+    let issued = oidc_core::code::issue_code(&tx, DISCORD_USER_ID.to_string(), &mut entropy(), NOW);
     block_on(store.put_authorization_code(&issued.record)).unwrap();
     let hash = hash_presented_code(&issued.plaintext);
     let bad = ExchangeCheck {

@@ -8,7 +8,9 @@ use serde::Deserialize;
 use url::Url;
 
 /// Scopes this provider can grant. Mirrors `scopes_supported` in discovery.
-pub const SUPPORTED_SCOPES: &[&str] = &["openid", "profile"];
+/// Only `openid` is supported: `/userinfo` is not implemented, so no other
+/// scope could return its associated claims.
+pub const SUPPORTED_SCOPES: &[&str] = &["openid"];
 
 /// Client classification (`type` in `OIDC_CLIENTS_JSON`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

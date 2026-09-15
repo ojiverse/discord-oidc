@@ -11,21 +11,6 @@ use crate::pkce;
 use crate::transaction::AuthorizationTransaction;
 use crate::util::{random_token, sha256_b64url, Entropy};
 
-/// Discord profile fields snapshotted at authentication time for use as
-/// ID Token claims when the `profile` scope was granted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileClaims {
-    /// Discord `username` -> `preferred_username`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preferred_username: Option<String>,
-    /// Discord `global_name` -> `name`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Discord avatar CDN URL -> `picture`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub picture: Option<String>,
-}
-
 /// Persisted authorization code record. The plaintext code never touches
 /// storage; `code_hash` is `base64url(SHA-256(code))`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,9 +30,6 @@ pub struct StoredAuthorizationCode {
     pub nonce: Option<String>,
     /// PKCE challenge bound to this code.
     pub code_challenge: String,
-    /// Discord profile snapshot for `profile`-scope claims.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<ProfileClaims>,
     /// Creation time (unix seconds).
     pub created_at: i64,
     /// Expiry time (unix seconds).
@@ -67,7 +49,6 @@ pub struct IssuedCode {
 pub fn issue_code(
     tx: &AuthorizationTransaction,
     subject: String,
-    profile: Option<ProfileClaims>,
     entropy: &mut impl Entropy,
     now: i64,
 ) -> IssuedCode {
@@ -81,7 +62,6 @@ pub fn issue_code(
             scope: tx.requested_scope.clone(),
             nonce: tx.nonce.clone(),
             code_challenge: tx.code_challenge.clone(),
-            profile,
             created_at: now,
             expires_at: now + AUTHORIZATION_CODE_TTL_SECS,
         },

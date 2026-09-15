@@ -9,8 +9,9 @@ use sha2::{Digest, Sha256};
 use crate::jwk::Jwk;
 use crate::util::b64url_encode;
 
-/// ID Token claims. `aud` is the single validated client ID; optional
-/// `profile`-scope claims come from the Discord snapshot.
+/// ID Token claims. `aud` is the single validated client ID. Only the
+/// `openid` scope is supported and `/userinfo` is not implemented, so no
+/// profile-derived claims are ever emitted here.
 #[derive(Debug, Serialize)]
 pub struct IdTokenClaims {
     /// Issuer (exact configured `OIDC_ISSUER_URL`).
@@ -29,15 +30,6 @@ pub struct IdTokenClaims {
     /// Access token hash claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at_hash: Option<String>,
-    /// `preferred_username` (profile scope).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preferred_username: Option<String>,
-    /// `name` (profile scope).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// `picture` (profile scope).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub picture: Option<String>,
 }
 
 /// Computes the OIDC `at_hash`: `base64url(leftmost_half(SHA-256(token)))`.
