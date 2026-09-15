@@ -1,16 +1,16 @@
 //! JWK / JWKS handling. Only public key material is ever represented; the
 //! validator for operator-supplied rotation keys actively rejects private
-//! fields.
+//! fields and malformed or undersized keys.
 
-use rsa::traits::PublicKeyParts;
-use rsa::RsaPublicKey;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::util::b64url_encode;
-
 /// JWK field names that constitute private key material.
 const PRIVATE_FIELDS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth"];
+
+/// Minimum accepted RSA modulus size, in bits.
+pub const MIN_RSA_MODULUS_BITS: usize = 2048;
 
 /// A public RSA JWK (`RS256`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,26 +44,71 @@ pub enum JwkError {
     /// `kty`, `n` or `e` is missing/mistyped, or `kty` is not `RSA`.
     #[error("JWK is not a valid RSA public key")]
     NotRsaPublic,
-    /// `kid` collides with the active signing key ID.
-    #[error("duplicate kid in additional JWKS: {0}")]
+    /// `n` or `e` is not valid base64url.
+    #[error("JWK n/e is not valid base64url")]
+    InvalidKeyMaterial,
+    /// The RSA modulus is smaller than [`MIN_RSA_MODULUS_BITS`].
+    #[error("JWK RSA modulus is smaller than {MIN_RSA_MODULUS_BITS} bits")]
+    WeakKey,
+    /// `alg` is present and not `RS256`, or `use` is present and not `sig`.
+    #[error("JWK alg/use is inconsistent with RS256 signing")]
+    UnsupportedAlgOrUse,
+    /// `kid` is missing, empty, or uses characters outside the allowed set.
+    #[error("JWK kid is missing or invalid")]
+    InvalidKid,
+    /// `kid` collides with the active signing key ID or another additional
+    /// key.
+    #[error("duplicate kid in JWKS: {0}")]
     DuplicateKeyId(String),
 }
 
+/// Returns true if `kid` uses only characters safe for a JOSE `kid` (the same
+/// policy applied to `OIDC_SIGNING_KEY_ID`).
+pub fn is_valid_kid(kid: &str) -> bool {
+    !kid.is_empty()
+        && kid.len() <= 64
+        && kid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Returns the bit length of a base64url-encoded unsigned big-endian integer,
+/// or `None` if the input is not valid base64url or encodes zero.
+pub fn b64url_uint_bits(s: &str) -> Option<usize> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .ok()?;
+    let mut iter = bytes.iter().skip_while(|&&b| b == 0);
+    let first = *iter.next()?;
+    let rest = iter.count();
+    Some(8 * (rest + 1) - first.leading_zeros() as usize)
+}
+
+/// Returns the bit length of the RSA modulus encoded in a JWK `n` member.
+pub fn rsa_modulus_bits(n_b64url: &str) -> Option<usize> {
+    b64url_uint_bits(n_b64url)
+}
+
 impl Jwk {
-    /// Derives the public JWK for an RSA public key.
-    pub fn from_public_key(key: &RsaPublicKey, kid: &str) -> Self {
+    /// Builds the public JWK for an RSA key from its base64url `n`/`e` and
+    /// `kid`, marking it as an `RS256` signing key.
+    pub fn new_rsa(n: String, e: String, kid: impl Into<String>) -> Self {
         Self {
             kty: "RSA".to_string(),
             use_: Some("sig".to_string()),
             alg: Some("RS256".to_string()),
-            kid: Some(kid.to_string()),
-            n: b64url_encode(&key.n().to_bytes_be()),
-            e: b64url_encode(&key.e().to_bytes_be()),
+            kid: Some(kid.into()),
+            n,
+            e,
         }
     }
 
     /// Validates an operator-supplied JWK JSON value as a *public* RSA key.
-    /// Rejects any private key material outright.
+    ///
+    /// Rejects private key material outright, requires `n`/`e` to be valid
+    /// base64url with a modulus of at least [`MIN_RSA_MODULUS_BITS`], enforces
+    /// `alg == RS256` / `use == sig` when those members are present, and
+    /// requires a well-formed `kid`.
     pub fn validate_public(value: &Value) -> Result<Self, JwkError> {
         let obj = value
             .as_object()
@@ -79,11 +124,29 @@ impl Jwk {
         }
         let n = get_str("n").ok_or(JwkError::NotRsaPublic)?;
         let e = get_str("e").ok_or(JwkError::NotRsaPublic)?;
+        let n_bits = rsa_modulus_bits(&n).ok_or(JwkError::InvalidKeyMaterial)?;
+        if n_bits < MIN_RSA_MODULUS_BITS {
+            return Err(JwkError::WeakKey);
+        }
+        if b64url_uint_bits(&e).is_none() {
+            return Err(JwkError::InvalidKeyMaterial);
+        }
+        match get_str("alg").as_deref() {
+            None | Some("RS256") => {}
+            _ => return Err(JwkError::UnsupportedAlgOrUse),
+        }
+        match get_str("use").as_deref() {
+            None | Some("sig") => {}
+            _ => return Err(JwkError::UnsupportedAlgOrUse),
+        }
+        let kid = get_str("kid")
+            .filter(|k| is_valid_kid(k))
+            .ok_or(JwkError::InvalidKid)?;
         Ok(Self {
             kty: "RSA".to_string(),
             use_: get_str("use"),
             alg: get_str("alg"),
-            kid: get_str("kid"),
+            kid: Some(kid),
             n,
             e,
         })

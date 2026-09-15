@@ -1,7 +1,9 @@
 # Local development secrets for `wrangler dev`. Never commit real values.
-# OIDC_SIGNING_PRIVATE_KEY accepts a PKCS#8 PEM ("-----BEGIN PRIVATE KEY-----")
-# or PKCS#1 PEM ("-----BEGIN RSA PRIVATE KEY-----"); newlines may be escaped
-# as \n when setting the value.
+# OIDC_SIGNING_PRIVATE_KEY must be an RSA >=2048 key in PKCS#8 form
+# ("-----BEGIN PRIVATE KEY-----", e.g. `openssl genpkey -algorithm RSA
+# -pkeyopt rsa_keygen_bits:2048`) or base64 PKCS#8 DER; PKCS#1
+# ("-----BEGIN RSA PRIVATE KEY-----") is not accepted. Newlines may be
+# escaped as \n when setting the value.
 
 DISCORD_CLIENT_SECRET=replace-me
 OIDC_SIGNING_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"

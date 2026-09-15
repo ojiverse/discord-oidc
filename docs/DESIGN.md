@@ -85,7 +85,7 @@ issuer hostname はコードへ固定しません。
 OIDC_ISSUER_URL=https://discord.id.ojiverse.example
 ```
 
-`OIDC_ISSUER_URL` には任意の stable HTTPS URL を指定できます。
+`OIDC_ISSUER_URL` には任意の stable HTTPS origin を指定できます。各 endpoint は root の固定 path (`/authorize`, `/token`, `/jwks.json`, `/oauth/discord/callback`) で route されるため、path を含む issuer は受理しません（§9.3 参照）。
 
 `ojiverse.example` はドキュメント用の予約ドメインです。
 
@@ -525,6 +525,8 @@ OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS  # rotation 中に公開する旧 public JWK �
 
 署名 algorithm は RS256 とし、Relying Party library との interoperability を優先します。
 
+署名は Cloudflare Workers の Web Crypto API (`crypto.subtle`) で行い、pure-Rust の RSA 実装は private key operation に使用しません（timing side-channel 対策、RUSTSEC-2023-0071 参照）。private key は PKCS#8 の RSA-2048 以上を要求します。
+
 `/jwks.json` では対応する public key のみ公開します。
 
 key rotation 時には、新しい private key で署名を開始し、旧 public key は `OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS` 経由で既発行 token の expiry がすべて過ぎるまで JWKS に残します。旧 private key は保持しません。
@@ -562,7 +564,8 @@ OIDC_CLIENT_SECRETS_JSON  # confidential client をサポートする場合
 少なくとも次を要求します。
 
 - absolute HTTPS URL
-- query / fragment を含まない
+- userinfo / query / fragment を含まない
+- path を含まない（origin のみ。`https://example.com/oidc` のような issuer は拒否する）
 - discovery document の `issuer` と ID Token の `iss` が完全一致
 - request `Host` header から issuer を推測しない
 

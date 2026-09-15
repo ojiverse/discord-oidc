@@ -312,7 +312,7 @@ confidential OIDC client を導入する場合、client secret は repository �
 
 secret は Cloudflare secret storage へ格納し、client authentication method は `client_secret_basic` とします。client secret の照合は timing-safe な比較で行います。
 
-初期の browser/public clients については client secret に依存せず PKCE を使用します。
+初期の public clients（native app、CLI 等）は client secret に依存せず PKCE を使用します。browser/SPA client は `/token` に CORS を提供しないため現状サポート外です（DESIGN §5 参照）。
 
 ---
 

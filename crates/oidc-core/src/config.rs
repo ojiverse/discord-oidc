@@ -21,7 +21,7 @@ pub const DEFAULT_ID_TOKEN_TTL_SECS: i64 = 900;
 /// is absent.
 #[derive(Debug, Default)]
 pub struct ConfigInput {
-    /// `OIDC_ISSUER_URL` — stable HTTPS issuer, no query/fragment.
+    /// `OIDC_ISSUER_URL` — stable HTTPS issuer origin, no path/query/fragment.
     pub issuer_url: Option<String>,
     /// `DISCORD_CLIENT_ID`.
     pub discord_client_id: Option<String>,
@@ -35,7 +35,8 @@ pub struct ConfigInput {
     pub client_secrets_json: Option<String>,
     /// `OIDC_SIGNING_KEY_ID` — `kid` for the active signing key.
     pub signing_key_id: Option<String>,
-    /// `OIDC_SIGNING_PRIVATE_KEY` — PKCS#8 (or PKCS#1) PEM / base64 DER (secret).
+    /// `OIDC_SIGNING_PRIVATE_KEY` — PKCS#8 PEM / base64 DER, RSA ≥2048
+    /// (secret). PKCS#1 is not accepted by Web Crypto `importKey`.
     pub signing_private_key: Option<String>,
     /// `OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS` — retired public JWKs kept in JWKS
     /// during rotation overlap.
@@ -74,7 +75,8 @@ pub enum ConfigError {
     /// A required variable is absent.
     #[error("missing required configuration: {0}")]
     Missing(&'static str),
-    /// `OIDC_ISSUER_URL` is not an absolute HTTPS URL without query/fragment.
+    /// `OIDC_ISSUER_URL` is not an absolute HTTPS origin (no
+    /// path/query/fragment/userinfo).
     #[error("invalid OIDC_ISSUER_URL: {0}")]
     InvalidIssuer(String),
     /// A Discord snowflake field is not all digits.
@@ -150,13 +152,17 @@ impl Config {
             Some(json) => {
                 let raw: Vec<serde_json::Value> = serde_json::from_str(json)
                     .map_err(|e| ConfigError::Jwk(JwkError::Malformed(e.to_string())))?;
+                let mut seen_kids = std::collections::HashSet::with_capacity(raw.len() + 1);
+                seen_kids.insert(signing_key_id.to_string());
                 let mut keys = Vec::with_capacity(raw.len());
                 for value in raw {
                     let jwk = Jwk::validate_public(&value)?;
-                    if jwk.kid.as_deref() == Some(signing_key_id) {
-                        return Err(ConfigError::Jwk(JwkError::DuplicateKeyId(
-                            signing_key_id.to_string(),
-                        )));
+                    if let Some(kid) = jwk.kid.as_deref() {
+                        if !seen_kids.insert(kid.to_string()) {
+                            return Err(ConfigError::Jwk(JwkError::DuplicateKeyId(
+                                kid.to_string(),
+                            )));
+                        }
                     }
                     keys.push(jwk);
                 }
@@ -207,8 +213,10 @@ fn required<'a>(value: Option<&'a str>, name: &'static str) -> Result<&'a str, C
     }
 }
 
-/// Validates `OIDC_ISSUER_URL`: absolute HTTPS URL, no userinfo, no query, no
-/// fragment. Returns the canonical issuer string (trailing slashes removed).
+/// Validates `OIDC_ISSUER_URL`: an absolute HTTPS *origin* — no userinfo, no
+/// query, no fragment, and no path components. Endpoints are routed at fixed
+/// root paths (`/authorize`, `/token`, ...), so a path-bearing issuer would
+/// produce discovery metadata that cannot be served.
 pub fn validate_issuer(raw: &str) -> Result<String, ConfigError> {
     let url = Url::parse(raw).map_err(|_| ConfigError::InvalidIssuer(raw.to_string()))?;
     if url.scheme() != "https"
@@ -217,6 +225,7 @@ pub fn validate_issuer(raw: &str) -> Result<String, ConfigError> {
         || url.query().is_some()
         || url.fragment().is_some()
         || url.host_str().is_none()
+        || url.path() != "/"
     {
         return Err(ConfigError::InvalidIssuer(raw.to_string()));
     }

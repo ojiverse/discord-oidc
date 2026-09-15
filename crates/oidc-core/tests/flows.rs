@@ -8,7 +8,7 @@ use oidc_core::code::{hash_presented_code, ConsumeDeny, ExchangeCheck};
 use oidc_core::discord::{DiscordError, DiscordMember, DiscordTokenResponse, DiscordUser};
 use oidc_core::error::OAuthErrorCode;
 use oidc_core::jwk::{jwks_document, Jwk, JwkError};
-use oidc_core::jwt::Rs256Signer;
+use oidc_core::jwt::{encode_claims, IdTokenSigner, KeyError};
 use oidc_core::response::CoreResponse;
 use oidc_core::store::{AuthorizationStore, InMemoryStore};
 use oidc_core::transaction::AuthorizationTransaction;
@@ -19,9 +19,6 @@ use oidc_core::{
 use pollster::block_on;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
-use rsa::pkcs8::EncodePrivateKey;
-use rsa::traits::PublicKeyParts;
-use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -45,10 +42,52 @@ fn urlenc(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-fn test_signer() -> Rs256Signer {
-    let mut rng = StdRng::seed_from_u64(7);
-    let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    Rs256Signer::from_private_key(key, "test-key-1")
+/// base64url of a 2048-bit unsigned integer (0x80 followed by zeroes) — a
+/// stand-in RSA modulus for JWK structure tests.
+const TEST_MODULUS_2048: &str = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQ";
+/// base64url of a 1024-bit integer — below the accepted key-size floor.
+const TEST_MODULUS_1024: &str = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// Deterministic stand-in for the platform signing backend (production uses
+/// Cloudflare Web Crypto). Produces structurally valid JWTs; cryptographic
+/// correctness of the real signer is a runtime property verified against
+/// the deployed Worker's JWKS, not on the host.
+struct TestSigner {
+    kid: String,
+}
+
+impl TestSigner {
+    fn new(kid: &str) -> Self {
+        Self {
+            kid: kid.to_string(),
+        }
+    }
+}
+
+impl IdTokenSigner for TestSigner {
+    fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    fn public_jwk(&self) -> Jwk {
+        Jwk::new_rsa(
+            TEST_MODULUS_2048.to_string(),
+            "AQAB".to_string(),
+            self.kid.clone(),
+        )
+    }
+
+    fn sign(
+        &self,
+        signing_input: String,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, KeyError>> + '_ {
+        let sig = Sha256::digest(format!("{}:{signing_input}", self.kid).as_bytes());
+        std::future::ready(Ok(sig.to_vec()))
+    }
+}
+
+fn test_signer() -> TestSigner {
+    TestSigner::new("test-key-1")
 }
 
 fn test_config() -> Config {
@@ -417,6 +456,20 @@ fn authorize_rejects_duplicate_params() {
     }
 }
 
+#[test]
+fn authorize_ignores_unrecognized_parameters() {
+    // RFC 6749 §3.1: unrecognized request parameters are ignored — OIDC
+    // extension params sent by conforming clients must not break the flow,
+    // even when duplicated or over-length.
+    let cfg = test_config();
+    let mut q = authorize_query(&[]);
+    q.push_str("&prompt=consent&login_hint=u&resource=https://api.example&prompt=again");
+    match validate_authorize_request(&q, &cfg) {
+        AuthorizeVerdict::Proceed(_) => {}
+        other => panic!("expected proceed, got {other:?}"),
+    }
+}
+
 // ---------- /oauth/discord/callback ----------
 
 #[test]
@@ -668,14 +721,9 @@ fn token_full_flow_issues_valid_id_token() {
     let expected_ath = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..16]);
     assert_eq!(claims["at_hash"], expected_ath);
 
-    signer
-        .public_key()
-        .verify(
-            Pkcs1v15Sign::new::<Sha256>(),
-            &Sha256::digest(input.as_bytes()),
-            &sig,
-        )
-        .unwrap();
+    // The deterministic TestSigner binds the signature to the signing input.
+    let expected_sig = Sha256::digest(format!("test-key-1:{input}").as_bytes());
+    assert_eq!(sig.as_slice(), expected_sig.as_slice());
 }
 
 #[test]
@@ -1015,7 +1063,7 @@ fn token_rejects_client_id_mismatch_basic_vs_body() {
 #[test]
 fn jwks_contains_only_public_material() {
     let signer = test_signer();
-    let jwk = Jwk::from_public_key(&signer.public_key(), signer.kid());
+    let jwk = signer.public_jwk();
     let doc = jwks_document(&[jwk]);
     let text = doc.to_string();
     for field in ["\"d\"", "\"p\"", "\"q\"", "\"dp\"", "\"dq\"", "\"qi\""] {
@@ -1038,11 +1086,108 @@ fn additional_jwks_rejects_private_material() {
 }
 
 #[test]
+fn additional_jwks_validates_key_material() {
+    let cases: Vec<(serde_json::Value, JwkError)> = vec![
+        // n / e must be valid base64url.
+        (
+            json!({"kty":"RSA","n":"!!!","e":"AQAB","kid":"r1"}),
+            JwkError::InvalidKeyMaterial,
+        ),
+        (
+            json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"***","kid":"r1"}),
+            JwkError::InvalidKeyMaterial,
+        ),
+        // Modulus below the 2048-bit floor.
+        (
+            json!({"kty":"RSA","n":TEST_MODULUS_1024,"e":"AQAB","kid":"r1"}),
+            JwkError::WeakKey,
+        ),
+        // alg / use inconsistent with an RS256 signing key, when present.
+        (
+            json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"AQAB","kid":"r1","alg":"ES256"}),
+            JwkError::UnsupportedAlgOrUse,
+        ),
+        (
+            json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"AQAB","kid":"r1","use":"enc"}),
+            JwkError::UnsupportedAlgOrUse,
+        ),
+        // kid is required and must use the allowed charset.
+        (
+            json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"AQAB"}),
+            JwkError::InvalidKid,
+        ),
+        (
+            json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"AQAB","kid":""}),
+            JwkError::InvalidKid,
+        ),
+        (
+            json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"AQAB","kid":"bad kid!"}),
+            JwkError::InvalidKid,
+        ),
+    ];
+    for (key, err) in cases {
+        assert_eq!(Jwk::validate_public(&key).unwrap_err(), err, "key: {key}");
+    }
+    // alg/use are optional; both absent and matching values are accepted.
+    for extra in [
+        json!({}),
+        json!({"alg":"RS256"}),
+        json!({"use":"sig"}),
+        json!({"alg":"RS256","use":"sig"}),
+    ] {
+        let mut key = json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"AQAB","kid":"r1"});
+        key.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(Jwk::validate_public(&key).is_ok(), "key: {key}");
+    }
+}
+
+fn config_with_additional_jwks(keys: serde_json::Value) -> Result<Config, oidc_core::ConfigError> {
+    let clients_json = json!([{
+        "client_id": PUBLIC_CLIENT,
+        "redirect_uris": [PUBLIC_REDIRECT],
+        "allowed_scopes": ["openid"],
+        "type": "public",
+        "token_endpoint_auth_method": "none",
+    }])
+    .to_string();
+    Config::from_input(&ConfigInput {
+        issuer_url: Some(ISSUER.to_string()),
+        discord_client_id: Some("111111111111111111".to_string()),
+        discord_client_secret: Some("discord-secret".to_string()),
+        required_guild_id: Some(GUILD.to_string()),
+        clients_json: Some(clients_json),
+        signing_key_id: Some("test-key-1".to_string()),
+        signing_private_key: Some("unused-in-these-tests".to_string()),
+        additional_public_jwks_json: Some(keys.to_string()),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn additional_jwks_rejects_duplicate_kids() {
+    let key = |kid: &str| json!({"kty":"RSA","n":TEST_MODULUS_2048,"e":"AQAB","kid":kid});
+    // Colliding with the active signing key id is rejected.
+    assert!(matches!(
+        config_with_additional_jwks(json!([key("test-key-1")])),
+        Err(oidc_core::ConfigError::Jwk(JwkError::DuplicateKeyId(_)))
+    ));
+    // Duplicates among the additional keys themselves are rejected.
+    assert!(matches!(
+        config_with_additional_jwks(json!([key("r1"), key("r1")])),
+        Err(oidc_core::ConfigError::Jwk(JwkError::DuplicateKeyId(_)))
+    ));
+    // Distinct kids are accepted.
+    assert!(config_with_additional_jwks(json!([key("r1"), key("r2")])).is_ok());
+}
+
+#[test]
 fn rotation_overlap_keeps_old_tokens_verifiable() {
-    let mut rng = StdRng::seed_from_u64(11);
-    let old_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    let old_signer = Rs256Signer::from_private_key(old_key.clone(), "old-kid");
-    let new_signer = test_signer();
+    // During rotation overlap the retired key stays published, so a token
+    // signed under the old `kid` still resolves to a JWKS entry.
+    let old_signer = TestSigner::new("old-kid");
+    let new_signer = TestSigner::new("new-kid");
 
     let claims = oidc_core::jwt::IdTokenClaims {
         iss: ISSUER.to_string(),
@@ -1056,12 +1201,9 @@ fn rotation_overlap_keeps_old_tokens_verifiable() {
         name: None,
         picture: None,
     };
-    let token = old_signer.encode_claims(&claims).unwrap();
+    let token = block_on(encode_claims(&old_signer, &claims)).unwrap();
 
-    let doc = jwks_document(&[
-        Jwk::from_public_key(&new_signer.public_key(), "new-kid"),
-        Jwk::from_public_key(&old_key.to_public_key(), "old-kid"),
-    ]);
+    let doc = jwks_document(&[new_signer.public_jwk(), old_signer.public_jwk()]);
     assert_eq!(doc["keys"].as_array().unwrap().len(), 2);
 
     let (header, _, sig, input) = decode_jwt(&token);
@@ -1072,25 +1214,12 @@ fn rotation_overlap_keeps_old_tokens_verifiable() {
         .iter()
         .find(|k| k["kid"] == "old-kid")
         .unwrap();
-    let decode = |s: &str| {
-        rsa::BigUint::from_bytes_be(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(s)
-                .unwrap(),
-        )
-    };
-    let pubkey = RsaPublicKey::new(
-        decode(matching["n"].as_str().unwrap()),
-        decode(matching["e"].as_str().unwrap()),
-    )
-    .unwrap();
-    pubkey
-        .verify(
-            Pkcs1v15Sign::new::<Sha256>(),
-            &Sha256::digest(input.as_bytes()),
-            &sig,
-        )
-        .unwrap();
+    assert_eq!(matching["kty"], "RSA");
+    assert_eq!(matching["n"], TEST_MODULUS_2048);
+    // The token's signature is bound to its signing input and the `kid` it
+    // was produced under.
+    let expected = Sha256::digest(format!("old-kid:{input}").as_bytes());
+    assert_eq!(sig.as_slice(), expected.as_slice());
 }
 
 #[test]
@@ -1131,6 +1260,10 @@ fn issuer_validation() {
         "https://discord.id.ojiverse.example?x=1",
         "https://discord.id.ojiverse.example#frag",
         "https://user@discord.id.ojiverse.example",
+        // Path-bearing issuers are rejected: endpoints are routed at fixed
+        // root paths, so discovery metadata under a prefix would 404.
+        "https://discord.id.ojiverse.example/oidc",
+        "https://discord.id.ojiverse.example//",
         "not-a-url",
     ] {
         assert!(validate_issuer(bad).is_err(), "accepted {bad}");
@@ -1200,25 +1333,6 @@ fn registry_rejects_wildcard_and_relative_redirects() {
             "accepted {uri}"
         );
     }
-}
-
-#[test]
-fn signer_parses_pkcs8_pem_and_base64_der() {
-    let mut rng = StdRng::seed_from_u64(3);
-    let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    let pem = key
-        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-        .unwrap()
-        .to_string();
-    let signer = Rs256Signer::from_secret_str(&pem, "k1").unwrap();
-    assert_eq!(signer.public_key().n(), key.to_public_key().n());
-    let der = key.to_pkcs8_der().unwrap();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_bytes());
-    let signer2 = Rs256Signer::from_secret_str(&b64, "k1").unwrap();
-    assert_eq!(signer2.public_key().e(), key.to_public_key().e());
-    let escaped = pem.replace('\n', "\\n");
-    assert!(Rs256Signer::from_secret_str(&escaped, "k1").is_ok());
-    assert!(Rs256Signer::from_secret_str("not a key", "k1").is_err());
 }
 
 #[test]

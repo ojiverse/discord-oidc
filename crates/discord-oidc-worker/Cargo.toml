@@ -19,6 +19,11 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Crypto", "CryptoKey", "SubtleCrypto"] }
+futures-util = "0.3"
+base64.workspace = true
 url.workspace = true
 
 [package.metadata.wasm-pack.profile.release]

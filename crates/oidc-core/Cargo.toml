@@ -13,7 +13,6 @@ sha2.workspace = true
 base64.workspace = true
 subtle.workspace = true
 url.workspace = true
-rsa = "0.9"
 percent-encoding = "2"
 
 [dev-dependencies]

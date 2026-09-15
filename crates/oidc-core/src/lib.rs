@@ -34,7 +34,7 @@ pub use config::{Config, ConfigError, ConfigInput};
 pub use discord::{DiscordApi, DiscordError, DiscordMember, DiscordTokenResponse, DiscordUser};
 pub use error::OAuthErrorCode;
 pub use jwk::{Jwk, JwkError};
-pub use jwt::{IdTokenClaims, KeyError, Rs256Signer};
+pub use jwt::{encode_claims, IdTokenClaims, IdTokenSigner, KeyError};
 pub use response::CoreResponse;
 pub use store::{AuthorizationStore, InMemoryStore, StoreError, TakeTransaction};
 pub use token::handle_token;

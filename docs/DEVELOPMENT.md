@@ -7,17 +7,23 @@ and `docs/SECURITY.md` in Rust on Cloudflare Workers (workers-rs).
 
 - `crates/oidc-core` — platform-agnostic provider logic: configuration and
   client-registry validation, `/authorize` request validation, authorization
-  transaction and code lifecycle, PKCE, RS256 ID Token issuance, JWKS,
-  discovery metadata, Discord callback orchestration, and `/token` handling.
-  It compiles and tests on the host; all endpoints produce a runtime-neutral
-  `CoreResponse`.
+  transaction and code lifecycle, PKCE, ID Token assembly, JWKS, discovery
+  metadata, Discord callback orchestration, and `/token` handling. Signing
+  is abstracted behind the `IdTokenSigner` trait; the crate carries no
+  cryptographic signing implementation of its own. It compiles and tests on
+  the host; all endpoints produce a runtime-neutral `CoreResponse`.
 - `crates/discord-oidc-worker` — the Cloudflare Worker: HTTP routing,
   environment/secret loading, the singleton `AuthorizationState` Durable
-  Object (SQLite-backed via `new_sqlite_classes`), and the Discord API client.
+  Object (SQLite-backed via `new_sqlite_classes`), the Discord API client,
+  and the `IdTokenSigner` implementation backed by Workers Web Crypto
+  (`crypto.subtle` RSASSA-PKCS1-v1_5) so private-key operations run in
+  constant-time native code.
 - `wrangler.toml` — Worker manifest: custom build, public vars, Durable
   Object binding, and the SQLite-class migration.
-- `.github/workflows/ci.yml` — format, lint, host tests, wasm build, and a
-  wrangler packaging dry-run.
+- `.github/workflows/ci.yml` — format, lint, host tests, `cargo audit`
+  (RustSec advisories), wasm build, and a wrangler packaging dry-run.
+  Actions are pinned to commit SHAs; `worker-build`, `wrangler`, and
+  `cargo-audit` are version-pinned.
 
 The boundary between the crates is the point of the design: everything an
 attacker could probe lives in `oidc-core` and is covered by host-side tests;
@@ -53,6 +59,12 @@ optionally `OIDC_JWKS_ADDITIONAL_PUBLIC_KEYS` and `OIDC_ID_TOKEN_TTL_SECONDS`.
 Secrets via `wrangler secret put` (or `.dev.vars` locally):
 `DISCORD_CLIENT_SECRET`, `OIDC_SIGNING_PRIVATE_KEY`, and
 `OIDC_CLIENT_SECRETS_JSON` when confidential clients are registered.
+
+`OIDC_ISSUER_URL` must be an HTTPS origin with no path (endpoints are
+routed at fixed root paths). `OIDC_SIGNING_PRIVATE_KEY` must be an
+RSA ≥2048 PKCS#8 key (PEM `-----BEGIN PRIVATE KEY-----` or base64 DER);
+PKCS#1 is not accepted. Generate one with
+`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`.
 
 The Discord application's redirect URI must be the issuer URL plus
 `/oauth/discord/callback`.

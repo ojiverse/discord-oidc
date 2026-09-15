@@ -23,6 +23,19 @@ const MAX_PARAM_LEN: usize = 2048;
 /// Maximum `state`/`nonce` length.
 const MAX_STATE_LEN: usize = 1024;
 
+/// Authorization request parameters this provider understands. Everything
+/// else is ignored per RFC 6749 §3.1.
+const KNOWN_PARAMETERS: &[&str] = &[
+    "response_type",
+    "client_id",
+    "redirect_uri",
+    "scope",
+    "state",
+    "nonce",
+    "code_challenge",
+    "code_challenge_method",
+];
+
 /// A validated authorization request.
 #[derive(Debug)]
 pub struct ValidatedAuthorize {
@@ -141,25 +154,18 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
         redirect_err(redirect_uri, code, desc, state.clone())
     };
 
-    for (name, values) in &params {
-        if values.len() > 1 {
-            return err(OAuthErrorCode::InvalidRequest, "duplicated parameter");
-        }
-        if values.iter().any(|v| v.len() > MAX_PARAM_LEN) {
-            return err(OAuthErrorCode::InvalidRequest, "parameter too long");
-        }
-        if !matches!(
-            name.as_str(),
-            "response_type"
-                | "client_id"
-                | "redirect_uri"
-                | "scope"
-                | "state"
-                | "nonce"
-                | "code_challenge"
-                | "code_challenge_method"
-        ) {
-            return err(OAuthErrorCode::InvalidRequest, "unexpected parameter");
+    // RFC 6749 §3.1: unrecognized request parameters are ignored. Only the
+    // known parameter set is checked for duplicates and length so that OIDC
+    // extension parameters (`prompt`, `login_hint`, `resource`, ...) sent by
+    // conforming clients do not break the flow.
+    for name in KNOWN_PARAMETERS {
+        if let Some(values) = params.get(*name) {
+            if values.len() > 1 {
+                return err(OAuthErrorCode::InvalidRequest, "duplicated parameter");
+            }
+            if values.iter().any(|v| v.len() > MAX_PARAM_LEN) {
+                return err(OAuthErrorCode::InvalidRequest, "parameter too long");
+            }
         }
     }
 

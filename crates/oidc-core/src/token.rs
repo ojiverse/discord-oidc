@@ -16,7 +16,7 @@ use crate::client::{ClientConfig, ClientType, TokenEndpointAuthMethod};
 use crate::code::{hash_presented_code, ExchangeCheck};
 use crate::config::Config;
 use crate::error::{ErrorBody, OAuthErrorCode};
-use crate::jwt::{at_hash, IdTokenClaims, Rs256Signer};
+use crate::jwt::{at_hash, encode_claims, IdTokenClaims, IdTokenSigner};
 use crate::response::CoreResponse;
 use crate::store::AuthorizationStore;
 use crate::util::{random_token, Entropy};
@@ -167,12 +167,12 @@ fn authenticate_client<'a>(
 
 /// Full `/token` handler. `form_body` must already be known to be
 /// `application/x-www-form-urlencoded` (the adapter checks Content-Type).
-pub async fn handle_token<S: AuthorizationStore, E: Entropy>(
+pub async fn handle_token<S: AuthorizationStore, E: Entropy, G: IdTokenSigner>(
     form_body: &str,
     auth_header: Option<&str>,
     cfg: &Config,
     store: &S,
-    signer: &Rs256Signer,
+    signer: &G,
     entropy: &mut E,
     now: i64,
 ) -> CoreResponse {
@@ -248,7 +248,7 @@ pub async fn handle_token<S: AuthorizationStore, E: Entropy>(
         name: profile.and_then(|p| p.name.clone()),
         picture: profile.and_then(|p| p.picture.clone()),
     };
-    let id_token = match signer.encode_claims(&claims) {
+    let id_token = match encode_claims(signer, &claims).await {
         Ok(t) => t,
         Err(_) => return json_error(500, OAuthErrorCode::ServerError, None, Vec::new()),
     };

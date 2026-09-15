@@ -1,13 +1,12 @@
-//! RS256 JWT issuance. Signing uses the `rsa` crate (no private key material
-//! ever leaves the provider; only the public JWK is exposed via JWKS).
+//! RS256 JWT issuance. Signing is delegated to an [`IdTokenSigner`]
+//! implementation supplied by the runtime — production uses Cloudflare Web
+//! Crypto so private-key operations run in constant-time native code; tests
+//! use a deterministic fake. Only the public JWK is ever exposed via JWKS.
 
-use base64::Engine;
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::jwk::Jwk;
 use crate::util::b64url_encode;
 
 /// ID Token claims. `aud` is the single validated client ID; optional
@@ -47,91 +46,58 @@ pub fn at_hash(access_token: &str) -> String {
     b64url_encode(&digest[..16])
 }
 
-fn parse_private_key(material: &str) -> Result<RsaPrivateKey, KeyError> {
-    if material.contains("BEGIN RSA PRIVATE KEY") {
-        return RsaPrivateKey::from_pkcs1_pem(material).map_err(|_| KeyError::Unparseable);
-    }
-    if material.contains("BEGIN") {
-        return RsaPrivateKey::from_pkcs8_pem(material).map_err(|_| KeyError::Unparseable);
-    }
-    let der = base64::engine::general_purpose::STANDARD
-        .decode(material.trim())
-        .map_err(|_| KeyError::Unparseable)?;
-    RsaPrivateKey::from_pkcs8_der(&der)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_der(&der))
-        .map_err(|_| KeyError::Unparseable)
-}
-
-/// Signing key load failure.
+/// Signing key load, validation, or sign failure.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {
-    /// The key material could not be parsed as PKCS#8 / PKCS#1 PEM or DER.
-    #[error("could not parse OIDC signing private key (expected PKCS#8 PEM or DER)")]
+    /// The key material could not be parsed / imported.
+    #[error("could not import OIDC signing private key (expected PKCS#8 PEM or DER)")]
     Unparseable,
+    /// The signing key is weaker than the required RSA-2048 floor.
+    #[error("OIDC signing key must be RSA-2048 or stronger")]
+    WeakKey,
     /// Signing failed.
-    #[error("RSA signing failed")]
+    #[error("JWT signing failed")]
     Sign,
 }
 
-/// An RS256 signer bound to a `kid`.
-pub struct Rs256Signer {
-    private: RsaPrivateKey,
-    kid: String,
+/// Signs ID Token signing-inputs and exposes the corresponding public JWK.
+///
+/// Implemented by the platform adapter (Cloudflare Web Crypto in production,
+/// a deterministic fake in tests) so `oidc-core` carries no cryptographic
+/// signing implementation of its own.
+pub trait IdTokenSigner {
+    /// The `kid` placed in JWT headers and the public JWK.
+    fn kid(&self) -> &str;
+
+    /// The public JWK advertised in `/jwks.json`.
+    fn public_jwk(&self) -> Jwk;
+
+    /// Produces an RS256 signature over `signing_input` (`header.payload`).
+    fn sign(
+        &self,
+        signing_input: String,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, KeyError>> + '_;
 }
 
-impl Rs256Signer {
-    /// Loads a private key from a PEM (PKCS#8 `PRIVATE KEY` or PKCS#1
-    /// `RSA PRIVATE KEY`) or base64-encoded DER string.
-    pub fn from_secret_str(material: &str, kid: impl Into<String>) -> Result<Self, KeyError> {
-        Ok(Self {
-            private: parse_private_key(&material.replace("\\n", "\n"))?,
-            kid: kid.into(),
-        })
-    }
-
-    /// Wraps an existing key (tests).
-    pub fn from_private_key(private: RsaPrivateKey, kid: impl Into<String>) -> Self {
-        Self {
-            private,
-            kid: kid.into(),
-        }
-    }
-
-    /// The `kid` placed in JWT headers and the public JWK.
-    pub fn kid(&self) -> &str {
-        &self.kid
-    }
-
-    /// The corresponding RSA public key.
-    pub fn public_key(&self) -> RsaPublicKey {
-        self.private.to_public_key()
-    }
-
-    /// Produces an RS256 signature over `signing_input`.
-    pub fn sign_rs256(&self, signing_input: &str) -> Result<Vec<u8>, KeyError> {
-        let digest = Sha256::digest(signing_input.as_bytes());
-        self.private
-            .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
-            .map_err(|_| KeyError::Sign)
-    }
-
-    /// Serializes and signs claims, returning a compact JWT.
-    pub fn encode_claims<T: Serialize>(&self, claims: &T) -> Result<String, KeyError> {
-        let header = serde_json::json!({
-            "alg": "RS256",
-            "typ": "JWT",
-            "kid": self.kid,
-        });
-        let input = format!(
-            "{}.{}",
-            b64url_encode(header.to_string().as_bytes()),
-            b64url_encode(
-                serde_json::to_string(claims)
-                    .map_err(|_| KeyError::Sign)?
-                    .as_bytes()
-            )
-        );
-        let signature = self.sign_rs256(&input)?;
-        Ok(format!("{}.{}", input, b64url_encode(&signature)))
-    }
+/// Serializes and signs claims with `signer`, returning a compact JWT.
+pub async fn encode_claims<S: IdTokenSigner, T: Serialize>(
+    signer: &S,
+    claims: &T,
+) -> Result<String, KeyError> {
+    let header = serde_json::json!({
+        "alg": "RS256",
+        "typ": "JWT",
+        "kid": signer.kid(),
+    });
+    let input = format!(
+        "{}.{}",
+        b64url_encode(header.to_string().as_bytes()),
+        b64url_encode(
+            serde_json::to_string(claims)
+                .map_err(|_| KeyError::Sign)?
+                .as_bytes()
+        )
+    );
+    let signature = signer.sign(input.clone()).await?;
+    Ok(format!("{}.{}", input, b64url_encode(&signature)))
 }

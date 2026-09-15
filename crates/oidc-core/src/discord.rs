@@ -8,10 +8,10 @@ use crate::config::Config;
 
 /// Discord OAuth2 authorization endpoint (fixed).
 pub const DISCORD_AUTHORIZE_URL: &str = "https://discord.com/oauth2/authorize";
-/// Discord token endpoint (fixed).
-pub const DISCORD_TOKEN_URL: &str = "https://discord.com/api/oauth2/token";
-/// Discord REST API base (fixed).
-pub const DISCORD_API_BASE: &str = "https://discord.com/api";
+/// Discord token endpoint (fixed, API version pinned).
+pub const DISCORD_TOKEN_URL: &str = "https://discord.com/api/v10/oauth2/token";
+/// Discord REST API base (fixed, API version pinned).
+pub const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 /// OAuth scopes requested from Discord: `identify guilds.members.read`.
 pub const DISCORD_SCOPES: &str = "identify guilds.members.read";
 

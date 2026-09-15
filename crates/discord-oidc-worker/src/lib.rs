@@ -5,13 +5,15 @@
 mod discord_http;
 mod do_store;
 mod durable;
+mod webcrypto;
 
-use std::cell::OnceCell;
+use std::cell::RefCell;
 use std::sync::Arc;
 
+use futures_util::future::{FutureExt, LocalBoxFuture, Shared};
 use oidc_core::config::{Config, ConfigInput};
-use oidc_core::jwk::{jwks_document, Jwk};
-use oidc_core::jwt::Rs256Signer;
+use oidc_core::jwk::jwks_document;
+use oidc_core::jwt::IdTokenSigner;
 use oidc_core::response::CoreResponse;
 use oidc_core::util::Entropy;
 use serde_json::json;
@@ -19,22 +21,37 @@ use worker::{console_error, console_log, event, Context, Date, Env, Method, Requ
 
 use discord_http::DiscordHttp;
 use do_store::DoStore;
+use webcrypto::WebCryptoSigner;
 
-/// Config + signing key, parsed once per isolate.
+/// Config + Web Crypto signing key, initialized once per isolate.
 struct Runtime {
     cfg: Config,
-    signer: Rs256Signer,
+    signer: WebCryptoSigner,
 }
+
+/// `load_runtime` is async (Web Crypto `importKey`), so initialization is
+/// memoized as a shared future: the first request drives it, concurrent and
+/// later requests await the same result.
+type RuntimeFuture = Shared<LocalBoxFuture<'static, Result<Arc<Runtime>, String>>>;
 
 thread_local! {
-    static RUNTIME: OnceCell<Result<Arc<Runtime>, String>> = const { OnceCell::new() };
+    static RUNTIME: RefCell<Option<RuntimeFuture>> = const { RefCell::new(None) };
 }
 
-fn runtime(env: &Env) -> Result<Arc<Runtime>, String> {
-    RUNTIME.with(|cell| cell.get_or_init(|| load_runtime(env).map(Arc::new)).clone())
+fn runtime(env: &Env) -> RuntimeFuture {
+    RUNTIME.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(|| {
+                load_runtime(env.clone())
+                    .map(|r| r.map(Arc::new))
+                    .boxed_local()
+                    .shared()
+            })
+            .clone()
+    })
 }
 
-fn load_runtime(env: &Env) -> Result<Runtime, String> {
+async fn load_runtime(env: Env) -> Result<Runtime, String> {
     let var = |name: &str| env.var(name).ok().map(|v| v.to_string());
     let secret = |name: &str| env.secret(name).ok().map(|s| s.to_string());
     let signing_key = secret("OIDC_SIGNING_PRIVATE_KEY");
@@ -51,10 +68,11 @@ fn load_runtime(env: &Env) -> Result<Runtime, String> {
         id_token_ttl_seconds: var("OIDC_ID_TOKEN_TTL_SECONDS"),
     };
     let cfg = Config::from_input(&input).map_err(|e| e.to_string())?;
-    let signer = Rs256Signer::from_secret_str(
+    let signer = WebCryptoSigner::from_secret_str(
         signing_key.as_deref().unwrap_or_default(),
         cfg.signing_key_id.clone(),
     )
+    .await
     .map_err(|e| e.to_string())?;
     Ok(Runtime { cfg, signer })
 }
@@ -130,7 +148,7 @@ async fn route(
     path: &str,
 ) -> worker::Result<Response> {
     // Config errors are logged server-side; the client gets a bare 500.
-    let rt = match runtime(env) {
+    let rt = match runtime(env).await {
         Ok(rt) => rt,
         Err(e) => {
             console_error!("configuration error: {e}");
@@ -153,10 +171,7 @@ async fn route(
             json_response(200, oidc_core::discovery::discovery_document(&rt.cfg))
         }
         (Method::Get, "/jwks.json") => {
-            let mut keys = vec![Jwk::from_public_key(
-                &rt.signer.public_key(),
-                rt.signer.kid(),
-            )];
+            let mut keys = vec![rt.signer.public_jwk()];
             keys.extend(rt.cfg.additional_public_jwks.iter().cloned());
             json_response(200, jwks_document(&keys))
         }
