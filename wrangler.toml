@@ -2,12 +2,18 @@ name = "discord-oidc"
 main = "crates/discord-oidc-worker/build/worker/shim.mjs"
 compatibility_date = "2025-09-01"
 
+# The issuer is served only on the custom domain; workers.dev is disabled.
+workers_dev = false
+routes = [
+  { pattern = "discord.id.ojiver.se", custom_domain = true },
+]
+
 [build]
 command = "cargo install -q worker-build && worker-build --release crates/discord-oidc-worker"
 
 [vars]
 # Non-secret configuration. See docs/DEVELOPMENT.md for the full model.
-OIDC_ISSUER_URL = "https://discord-oidc.ojiverse.workers.dev"
+OIDC_ISSUER_URL = "https://discord.id.ojiver.se"
 DISCORD_CLIENT_ID = "1549449390509392013"
 DISCORD_REQUIRED_GUILD_ID = "577577973159559219"
 # Post-deploy verification client. Public + PKCE; localhost redirect only.

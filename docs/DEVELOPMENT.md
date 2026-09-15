@@ -107,9 +107,17 @@ deploy is only green once the live Worker answers correctly.
 
 One-time setup, none of which lives in the repository:
 
-- Cloudflare: create the `workers.dev` subdomain (open Workers & Pages in
-  the dashboard once) and an API token with Workers Scripts edit on the
-  account; put the account ID in the `CLOUDFLARE_ACCOUNT_ID` repo variable.
+- Cloudflare: the zone backing the custom domain route in `wrangler.toml`
+  (`ojiver.se` for `discord.id.ojiver.se`) must be active on the same
+  account — `wrangler deploy` then creates the custom domain, its DNS
+  record, and certificate automatically. `workers_dev = false` disables
+  the `workers.dev` route, so no workers.dev subdomain is needed. The
+  deploy API token needs Workers Scripts edit on the account; put the
+  account ID in the `CLOUDFLARE_ACCOUNT_ID` repo variable.
+- Discord: register `{OIDC_ISSUER_URL}/oauth/discord/callback` as the
+  redirect URI on the Discord application whenever the issuer changes —
+  an issuer hostname change is an external identity migration, not a
+  cosmetic change (see `docs/DESIGN.md`).
 - 1Password: an admin connects the GitHub organization under Developer →
   integrations → GitHub Actions, which yields `OP_INTEGRATION_KEY` (kept as
   a GitHub organization secret). The `discord-oidc-prod` Environment holds
