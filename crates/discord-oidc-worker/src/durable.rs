@@ -126,13 +126,13 @@ impl DurableObject for AuthorizationState {
                 let tx: AuthorizationTransaction = req.json().await?;
                 storage.put(&tx_key(&tx.discord_oauth_state), &tx).await?;
                 self.ensure_alarm().await?;
-                Response::ok("ok")
+                Response::from_json(&serde_json::json!({ "ok": true }))
             }
             (Method::Put, "/codes") => {
                 let code: StoredAuthorizationCode = req.json().await?;
                 storage.put(&code_key(&code.code_hash), &code).await?;
                 self.ensure_alarm().await?;
-                Response::ok("ok")
+                Response::from_json(&serde_json::json!({ "ok": true }))
             }
             (Method::Post, "/take-transaction") => {
                 let body: TakeTransactionRequest = req.json().await?;
