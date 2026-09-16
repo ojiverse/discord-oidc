@@ -7,6 +7,7 @@
 //! `discord-oidc-worker` crate adapts it to Workers, and tests exercise it on
 //! the host.
 
+pub mod admin;
 pub mod authorize;
 pub mod callback;
 pub mod client;
@@ -18,6 +19,8 @@ pub mod error;
 pub mod jwk;
 pub mod jwt;
 pub mod pkce;
+pub mod registry;
+pub mod resolver;
 pub mod response;
 pub mod store;
 pub mod token;
@@ -35,6 +38,11 @@ pub use discord::{DiscordApi, DiscordError, DiscordMember, DiscordTokenResponse,
 pub use error::OAuthErrorCode;
 pub use jwk::{Jwk, JwkError};
 pub use jwt::{encode_claims, IdTokenClaims, IdTokenSigner, KeyError};
+pub use registry::{
+    ClientMetadata, ClientStatus, DynamicClientRecord, DynamicClientRegistry,
+    InMemoryClientRegistry, RegistryStoreError, RotateOutcome,
+};
+pub use resolver::{ClientResolver, RegistryResolver};
 pub use response::CoreResponse;
 pub use store::{AuthorizationStore, InMemoryStore, StoreError, TakeTransaction};
 pub use token::handle_token;

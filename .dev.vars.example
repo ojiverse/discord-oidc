@@ -9,3 +9,7 @@ DISCORD_CLIENT_SECRET=replace-me
 OIDC_SIGNING_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 # Only needed when OIDC_CLIENTS_JSON registers confidential clients:
 # OIDC_CLIENT_SECRETS_JSON={"rp-b-client-id":"at-least-16-chars"}
+# Bearer token for the /admin/clients API (dynamic RP registry). Generate a
+# high-entropy value (e.g. `openssl rand -base64 32`). If unset the admin API
+# fails closed: every request is 401.
+# OIDC_ADMIN_API_TOKEN=replace-me

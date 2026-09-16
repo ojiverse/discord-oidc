@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use oidc_core::code::{evaluate_code_exchange, ConsumeDeny, StoredAuthorizationCode};
+use oidc_core::registry::{ClientMetadata, ClientStatus, DynamicClientRecord};
 use oidc_core::transaction::AuthorizationTransaction;
 use serde::{Deserialize, Serialize};
 use worker::js_sys;
@@ -189,5 +190,162 @@ impl DurableObject for AuthorizationState {
         let now = (worker::Date::now().as_millis() / 1000) as i64;
         self.sweep(now).await?;
         Response::ok("ok")
+    }
+}
+
+const CLIENT_PREFIX: &str = "client:";
+
+fn client_key(client_id: &str) -> String {
+    format!("{CLIENT_PREFIX}{client_id}")
+}
+
+/// Wire reply for `POST /insert`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InsertReply {
+    /// Whether the record was inserted (`false` = `client_id` already used).
+    pub inserted: bool,
+}
+
+/// Wire reply for `POST /rotate-secret`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RotateSecretReply {
+    /// Rotation applied; carries the updated record.
+    Rotated(Box<DynamicClientRecord>),
+    /// No client with that `client_id`.
+    NotFound,
+    /// The client has no secret to rotate (public type).
+    NoSecret,
+}
+
+#[derive(Deserialize)]
+struct ClientIdRequest {
+    client_id: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateMetadataRequest {
+    client_id: String,
+    metadata: ClientMetadata,
+    now: i64,
+}
+
+#[derive(Deserialize)]
+struct SetStatusRequest {
+    client_id: String,
+    status: ClientStatus,
+    now: i64,
+}
+
+#[derive(Deserialize)]
+struct RotateSecretRequest {
+    client_id: String,
+    new_secret_hash: String,
+    now: i64,
+}
+
+/// Singleton dynamic client registry.
+///
+/// Storage adapter only: every endpoint performs its read-modify-write inside
+/// one fetch invocation, which the runtime serializes — no concurrent update
+/// or rotation can be lost. All validation and transition policy lives in
+/// `oidc_core::registry`; this object trusts the Worker (its only caller) to
+/// have applied it.
+#[durable_object]
+pub struct ClientRegistryState {
+    state: State,
+}
+
+impl DurableObject for ClientRegistryState {
+    fn new(state: State, _env: Env) -> Self {
+        Self { state }
+    }
+
+    async fn fetch(&self, mut req: Request) -> worker::Result<Response> {
+        let storage = self.state.storage();
+        let url = req.url()?;
+        match (req.method(), url.path()) {
+            (Method::Post, "/get") => {
+                let body: ClientIdRequest = req.json().await?;
+                let record: Option<DynamicClientRecord> =
+                    storage.get(&client_key(&body.client_id)).await?;
+                Response::from_json(&record)
+            }
+            (Method::Post, "/list") => {
+                let map = storage.list().await?;
+                let mut records: Vec<DynamicClientRecord> = Vec::new();
+                let entries = map.entries();
+                loop {
+                    let next = entries.next()?;
+                    if next.done() {
+                        break;
+                    }
+                    let pair = js_sys::Array::from(&next.value());
+                    let key = pair.get(0).as_string().unwrap_or_default();
+                    if !key.starts_with(CLIENT_PREFIX) {
+                        continue;
+                    }
+                    records.push(serde_wasm_bindgen::from_value(pair.get(1))?);
+                }
+                records.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+                Response::from_json(&records)
+            }
+            (Method::Post, "/insert") => {
+                let record: DynamicClientRecord = req.json().await?;
+                let key = client_key(&record.client_id);
+                let inserted = storage.get::<serde_json::Value>(&key).await?.is_none();
+                if inserted {
+                    storage.put(&key, &record).await?;
+                }
+                Response::from_json(&InsertReply { inserted })
+            }
+            (Method::Post, "/update-metadata") => {
+                let body: UpdateMetadataRequest = req.json().await?;
+                let key = client_key(&body.client_id);
+                let record: Option<DynamicClientRecord> =
+                    match storage.get::<DynamicClientRecord>(&key).await? {
+                        Some(mut r) => {
+                            r.apply_metadata(body.metadata, body.now);
+                            storage.put(&key, &r).await?;
+                            Some(r)
+                        }
+                        None => None,
+                    };
+                Response::from_json(&record)
+            }
+            (Method::Post, "/set-status") => {
+                let body: SetStatusRequest = req.json().await?;
+                let key = client_key(&body.client_id);
+                let record: Option<DynamicClientRecord> =
+                    match storage.get::<DynamicClientRecord>(&key).await? {
+                        Some(mut r) => {
+                            match body.status {
+                                ClientStatus::Active => r.enable(body.now),
+                                ClientStatus::Disabled => r.disable(body.now),
+                            }
+                            storage.put(&key, &r).await?;
+                            Some(r)
+                        }
+                        None => None,
+                    };
+                Response::from_json(&record)
+            }
+            (Method::Post, "/rotate-secret") => {
+                let body: RotateSecretRequest = req.json().await?;
+                let key = client_key(&body.client_id);
+                let reply = match storage.get::<DynamicClientRecord>(&key).await? {
+                    Some(mut r) => match r.rotate_secret(body.new_secret_hash, body.now) {
+                        Ok(_) => {
+                            storage.put(&key, &r).await?;
+                            RotateSecretReply::Rotated(Box::new(r))
+                        }
+                        Err(_) => RotateSecretReply::NoSecret,
+                    },
+                    None => RotateSecretReply::NotFound,
+                };
+                Response::from_json(&reply)
+            }
+            _ => Response::error("not found", 404),
+        }
     }
 }

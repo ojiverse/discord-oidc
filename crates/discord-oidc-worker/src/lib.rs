@@ -5,6 +5,7 @@
 mod discord_http;
 mod do_store;
 mod durable;
+mod registry_client;
 mod webcrypto;
 
 use std::cell::RefCell;
@@ -14,6 +15,7 @@ use futures_util::future::{FutureExt, LocalBoxFuture, Shared};
 use oidc_core::config::{Config, ConfigInput};
 use oidc_core::jwk::jwks_document;
 use oidc_core::jwt::IdTokenSigner;
+use oidc_core::resolver::RegistryResolver;
 use oidc_core::response::CoreResponse;
 use oidc_core::util::Entropy;
 use serde_json::json;
@@ -21,12 +23,16 @@ use worker::{console_error, console_log, event, Context, Date, Env, Method, Requ
 
 use discord_http::DiscordHttp;
 use do_store::DoStore;
+use registry_client::RegistryClient;
 use webcrypto::WebCryptoSigner;
 
 /// Config + Web Crypto signing key, initialized once per isolate.
 struct Runtime {
     cfg: Config,
     signer: WebCryptoSigner,
+    /// `OIDC_ADMIN_API_TOKEN` secret; `None` disables the admin API (all
+    /// requests fail closed as `401 unauthorized`).
+    admin_token: Option<String>,
 }
 
 /// `load_runtime` is async (Web Crypto `importKey`), so initialization is
@@ -74,7 +80,11 @@ async fn load_runtime(env: Env) -> Result<Runtime, String> {
     )
     .await
     .map_err(|e| e.to_string())?;
-    Ok(Runtime { cfg, signer })
+    Ok(Runtime {
+        cfg,
+        signer,
+        admin_token: secret("OIDC_ADMIN_API_TOKEN"),
+    })
 }
 
 /// Cryptographically secure entropy from the Workers runtime.
@@ -162,9 +172,37 @@ async fn route(
             return json_response(500, json!({ "error": "server_error" }));
         }
     };
+    // The registry client degrades to always-error when the binding is
+    // absent; static clients keep working in that case.
+    let registry = RegistryClient::from_env(env);
+    let resolver = RegistryResolver::new(&rt.cfg, &registry);
     let now = now_unix();
     let mut entropy = WorkerEntropy;
     let query = req.url()?.query().unwrap_or_default().to_string();
+
+    // Private control plane: bearer-authenticated admin API. The
+    // Authorization header and any request body are never logged.
+    if path == "/admin" || path.starts_with("/admin/") {
+        let body = match method {
+            Method::Post | Method::Put => Some(req.text().await.unwrap_or_default()),
+            _ => None,
+        };
+        let authorization = req.headers().get("authorization").ok().flatten();
+        return to_response(
+            oidc_core::admin::handle_admin_request(
+                method.as_ref(),
+                path,
+                body.as_deref(),
+                authorization.as_deref(),
+                rt.admin_token.as_deref(),
+                &rt.cfg,
+                &registry,
+                &mut entropy,
+                now,
+            )
+            .await,
+        );
+    }
 
     match (method, path) {
         (Method::Get, "/.well-known/openid-configuration") => {
@@ -176,13 +214,22 @@ async fn route(
             json_response(200, jwks_document(&keys))
         }
         (Method::Get, "/authorize") => to_response(
-            oidc_core::handle_authorize(&query, &rt.cfg, &store, &mut entropy, now).await,
+            oidc_core::handle_authorize(&query, &rt.cfg, &store, &resolver, &mut entropy, now)
+                .await,
         ),
         (Method::Get, "/oauth/discord/callback") => {
             let discord = DiscordHttp::new(&rt.cfg);
             to_response(
-                oidc_core::handle_callback(&query, &rt.cfg, &store, &discord, &mut entropy, now)
-                    .await,
+                oidc_core::handle_callback(
+                    &query,
+                    &rt.cfg,
+                    &store,
+                    &resolver,
+                    &discord,
+                    &mut entropy,
+                    now,
+                )
+                .await,
             )
         }
         (Method::Post, "/token") => {
@@ -206,6 +253,7 @@ async fn route(
                     auth_header.as_deref(),
                     &rt.cfg,
                     &store,
+                    &resolver,
                     &rt.signer,
                     &mut entropy,
                     now,

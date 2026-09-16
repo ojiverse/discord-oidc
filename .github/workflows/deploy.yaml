@@ -52,7 +52,8 @@ jobs:
 
       # Loads every variable in the linked 1Password Environment as env vars
       # (CLOUDFLARE_API_TOKEN, DISCORD_CLIENT_SECRET, OIDC_SIGNING_PRIVATE_KEY,
-      # optional OIDC_CLIENT_SECRETS_JSON). See docs/DEVELOPMENT.md.
+      # optional OIDC_CLIENT_SECRETS_JSON, optional OIDC_ADMIN_API_TOKEN).
+      # See docs/DEVELOPMENT.md.
       - name: Load secrets from 1Password
         uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2 # v5.0.1
         with:
@@ -74,11 +75,14 @@ jobs:
             --arg discord "$DISCORD_CLIENT_SECRET" \
             --arg key "$OIDC_SIGNING_PRIVATE_KEY" \
             --arg clients "${OIDC_CLIENT_SECRETS_JSON:-}" \
+            --arg admin "${OIDC_ADMIN_API_TOKEN:-}" \
             '{
                DISCORD_CLIENT_SECRET: $discord,
                OIDC_SIGNING_PRIVATE_KEY: $key
              } + (if $clients == "" then {}
-                  else { OIDC_CLIENT_SECRETS_JSON: $clients } end)' \
+                  else { OIDC_CLIENT_SECRETS_JSON: $clients } end)
+               + (if $admin == "" then {}
+                  else { OIDC_ADMIN_API_TOKEN: $admin } end)' \
             | npx --yes wrangler@4.131.2 secret bulk
 
       # Public vars come from wrangler.toml, so the issuer URL is read back

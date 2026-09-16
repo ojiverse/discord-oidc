@@ -100,7 +100,7 @@ pub enum ConfigError {
 
 /// Returns true if `value` looks like a Discord snowflake (all ASCII digits,
 /// plausible length).
-fn is_snowflake(value: &str) -> bool {
+pub(crate) fn is_snowflake(value: &str) -> bool {
     (15..=22).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 

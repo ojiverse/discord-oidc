@@ -15,16 +15,18 @@
 概念的な信頼境界は次の通りです。
 
 ```text
-Browser / Relying Party
-        │
-        │ OIDC
-        ▼
-┌──────────────────────────┐
-│ discord-oidc             │
+Browser / Relying Party        Operator (admin)
+        │                            │ Bearer token
+        │ OIDC                       ▼
+        │                     /admin/clients
+        ▼                            │
+┌──────────────────────────┐         │
+│ discord-oidc             │◄────────┘
 │ Cloudflare Worker        │
 │                          │
 │ OpenID Provider          │
 │ AuthorizationState DO    │
+│ ClientRegistryState DO   │
 └────────────┬─────────────┘
              │ Discord OAuth2/API
              ▼
@@ -35,9 +37,10 @@ Browser / Relying Party
 
 - configured Discord OAuth2/API endpoints
 - configured Discord application credentials
-- configured OIDC client registry
+- static client registry (`OIDC_CLIENTS_JSON`) と dynamic client registry (`ClientRegistryState` DO)
 - configured signing key
 - configured required Guild ID
+- `OIDC_ADMIN_API_TOKEN` を保持する運用者のみ (admin API の認証)
 
 Relying Party から渡される値は、登録済み client configuration と照合するまで信頼しません。
 
@@ -59,10 +62,13 @@ Relying Party から渡される値は、登録済み client configuration と�
 8. ID Token の `iss` は configured `OIDC_ISSUER_URL` と完全一致する。
 9. ID Token の `sub` は authenticated Discord user の stable user ID から決定する。
 10. ID Token の `aud` は認証要求元として検証済みの OIDC client に対応する。
-11. signing private key、Discord client secret、confidential client secret を公開しない。
+11. signing private key、Discord client secret、confidential client secret、admin API token を公開しない。
 12. Discord access / refresh token を Relying Party に渡さない。
 13. token、authorization code、secret を application log に記録しない。
 14. username、email、display name、Guild role を subject identifier の代わりに使用しない。
+15. `status=disabled` の dynamic client は `/authorize`、callback、`/token` のすべてで拒否され、issue 済み code も exchange できない。
+16. dynamic client の secret は plaintext では永続化せず (SHA-256 hash のみ)、plaintext は create/rotate response で一度だけ返す。
+17. admin API は `OIDC_ADMIN_API_TOKEN` との constant-time 比較で認証し、token 未設定時は fail closed とする。
 
 ---
 
@@ -363,7 +369,7 @@ confidential client で client authentication を行う場合でも、Authorizat
 
 ## 6. Client registry security
 
-Static client registry は security boundary です。
+Client registry は security boundary です。
 
 client registration には少なくとも以下を明示します。
 
@@ -375,9 +381,43 @@ allowed scopes
 client authentication method
 ```
 
-configuration change は code/config review の対象にします。
+### 6.1 Static registry
 
-Dynamic Client Registration は初期スコープ外です。
+static client は `OIDC_CLIENTS_JSON` で明示し、configuration change は code/config review の対象にします。static client は常に dynamic registry より優先して解決され、admin API からの変更は `409 static_client_immutable` で拒否されます。
+
+### 6.2 Dynamic registry と admin API
+
+dynamic client は `ClientRegistryState` Durable Object に永続化され、運用者のみが bearer 認証付き admin API (`/admin/clients`) から操作します。RFC 7591 の公開 self-service registration は提供しません。
+
+admin API の security 特性:
+
+- `Authorization: Bearer <OIDC_ADMIN_API_TOKEN>` を constant-time で比較する
+- token 未設定時を含め、認証失敗は常に `401 unauthorized` (fail closed)
+- `Authorization` header と token は決して log しない
+- すべての response は `Cache-Control: no-store`、CORS header なし
+- storage/crypto の内部詳細を error response に含めない
+- request body は 8 KiB 上限
+
+dynamic `client_id` は `oji_` + 128 bit random (base64url) で生成し、dynamic/static 双方との衝突を generation 時に検査します。生成される `client_id` は予測不能であり、登録自体は列挙攻撃面を持ちません。
+
+dynamic confidential client の secret は:
+
+- provider 側で 256 bit random として生成する
+- plaintext は create / rotate の response で一度だけ返し、以後いかなる GET にも含めない
+- storage には `base64url(SHA-256(secret))` のみ保持する
+- constant-time 比較で照合する
+- rotation では旧 secret を 600 秒だけ受け付け、2 回目の rotation で最も古い secret を即座に失効させる
+
+public client は secret を持たず、rotation は `client_has_no_secret` で拒否します。
+
+`status=disabled` は即時生效します。
+
+- `/authorize` は redirect せず `unauthorized_client` を render
+- callback は Discord code の交換も provider code の発行も行わず `unauthorized_client`
+- `/token` は `invalid_client` — issue 済みの code も exchange できない
+- disable/enable は idempotent で、PUT / rotate は disabled 状態を維持したまま成功する
+
+`owner_discord_user_id` は OJIverse 内の連絡先 metadata であり、authorization 判断には使用せず、Discord API への照会も行いません (syntax としての snowflake validation のみ)。
 
 ---
 
@@ -416,10 +456,13 @@ authentication failure を追跡できるだけの observability は必要です
 - Discord access / refresh token
 - authorization code
 - PKCE verifier
-- client secret
+- client secret (plaintext・hash とも)
 - signing private key
 - full ID Token
 - session cookie
+- `OIDC_ADMIN_API_TOKEN` と admin request の `Authorization` header
+
+admin 操作は、操作種別・対象 `client_id`・成功/失敗の category・correlation ID (`cf-ray`) のみを記録します。secret を含み得る request body は記録しません。
 
 `sub` をログへ記録する必要がある場合も、運用要件を確認し、必要最小限にします。
 
@@ -521,6 +564,17 @@ security-sensitive dependency は lockfile で固定し、Renovate / Dependabot 
 - new token uses new `kid`
 - private key is never present in JWKS
 
+### Client registry / admin API
+
+- missing / malformed / wrong bearer token → `401`
+- `OIDC_ADMIN_API_TOKEN` 未設定 → `401` (fail closed)
+- static client の mutation → `409 static_client_immutable`
+- public client の rotation → `client_has_no_secret`
+- GET / list が plaintext secret や hash を含まない
+- disabled client が `/authorize` / callback / `/token` で拒否される
+- rotation overlap 中の旧 secret 受理と window 後の拒否
+- 2 回目の rotation で最も古い secret が失効する
+
 ---
 
 ## 13. Security reporting
@@ -533,7 +587,8 @@ security incident では、必要に応じて以下を直ちに rotation / revoc
 
 - Discord client secret
 - OIDC signing key
-- confidential client secret
+- confidential client secret (static: `OIDC_CLIENT_SECRETS_JSON`、dynamic: admin API の rotate-secret)
+- `OIDC_ADMIN_API_TOKEN`
 - Cloudflare deployment/API token
 
 ---

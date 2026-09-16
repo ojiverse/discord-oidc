@@ -1,326 +1,25 @@
 //! End-to-end coverage of the security properties required of the provider
 //! (see docs/SECURITY.md), exercised entirely on the host.
 
-use std::collections::HashMap;
+mod support;
 
 use base64::Engine;
 use oidc_core::code::{hash_presented_code, ConsumeDeny, ExchangeCheck};
-use oidc_core::discord::{DiscordError, DiscordMember, DiscordTokenResponse, DiscordUser};
+use oidc_core::discord::DiscordUser;
 use oidc_core::error::OAuthErrorCode;
 use oidc_core::jwk::{jwks_document, Jwk, JwkError};
-use oidc_core::jwt::{encode_claims, IdTokenSigner, KeyError};
+use oidc_core::jwt::{encode_claims, IdTokenSigner};
 use oidc_core::response::CoreResponse;
 use oidc_core::store::{AuthorizationStore, InMemoryStore};
 use oidc_core::transaction::AuthorizationTransaction;
 use oidc_core::{
     handle_authorize, handle_callback, handle_token, validate_authorize_request, AuthorizeVerdict,
-    Config, ConfigInput, Entropy,
+    Config, ConfigInput,
 };
 use pollster::block_on;
-use rand::rngs::StdRng;
-use rand::{RngCore, SeedableRng};
-use serde_json::{json, Value};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-
-const NOW: i64 = 1_800_000_000;
-const ISSUER: &str = "https://discord.id.ojiverse.example";
-const PUBLIC_CLIENT: &str = "rp-a-client-id";
-const PUBLIC_REDIRECT: &str = "https://rp-a.ojiverse.example/auth/callback";
-const CONF_CLIENT: &str = "rp-b-client-id";
-const CONF_REDIRECT: &str = "https://rp-b.ojiverse.example/oidc/callback";
-const CONF_SECRET: &str = "0123456789abcdef-super-secret";
-const GUILD: &str = "123456789012345678";
-const DISCORD_USER_ID: &str = "987654321098765432";
-const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY0123";
-
-fn challenge_for(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn urlenc(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
-/// base64url of a 2048-bit unsigned integer (0x80 followed by zeroes) — a
-/// stand-in RSA modulus for JWK structure tests.
-const TEST_MODULUS_2048: &str = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQ";
-/// base64url of a 1024-bit integer — below the accepted key-size floor.
-const TEST_MODULUS_1024: &str = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-/// Deterministic stand-in for the platform signing backend (production uses
-/// Cloudflare Web Crypto). Produces structurally valid JWTs; cryptographic
-/// correctness of the real signer is a runtime property verified against
-/// the deployed Worker's JWKS, not on the host.
-struct TestSigner {
-    kid: String,
-}
-
-impl TestSigner {
-    fn new(kid: &str) -> Self {
-        Self {
-            kid: kid.to_string(),
-        }
-    }
-}
-
-impl IdTokenSigner for TestSigner {
-    fn kid(&self) -> &str {
-        &self.kid
-    }
-
-    fn public_jwk(&self) -> Jwk {
-        Jwk::new_rsa(
-            TEST_MODULUS_2048.to_string(),
-            "AQAB".to_string(),
-            self.kid.clone(),
-        )
-    }
-
-    fn sign(
-        &self,
-        signing_input: String,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, KeyError>> + '_ {
-        let sig = Sha256::digest(format!("{}:{signing_input}", self.kid).as_bytes());
-        std::future::ready(Ok(sig.to_vec()))
-    }
-}
-
-fn test_signer() -> TestSigner {
-    TestSigner::new("test-key-1")
-}
-
-fn test_config() -> Config {
-    let clients_json = json!([
-        {
-            "client_id": PUBLIC_CLIENT,
-            "redirect_uris": [PUBLIC_REDIRECT],
-            "allowed_scopes": ["openid"],
-            "type": "public",
-            "token_endpoint_auth_method": "none",
-        },
-        {
-            "client_id": CONF_CLIENT,
-            "redirect_uris": [CONF_REDIRECT],
-            "allowed_scopes": ["openid"],
-            "type": "confidential",
-            "token_endpoint_auth_method": "client_secret_basic",
-        }
-    ])
-    .to_string();
-    let secrets_json = json!({ CONF_CLIENT: CONF_SECRET }).to_string();
-    Config::from_input(&ConfigInput {
-        issuer_url: Some(ISSUER.to_string()),
-        discord_client_id: Some("111111111111111111".to_string()),
-        discord_client_secret: Some("discord-secret".to_string()),
-        required_guild_id: Some(GUILD.to_string()),
-        clients_json: Some(clients_json),
-        client_secrets_json: Some(secrets_json),
-        signing_key_id: Some("test-key-1".to_string()),
-        signing_private_key: Some("unused-in-these-tests".to_string()),
-        ..Default::default()
-    })
-    .unwrap()
-}
-
-fn entropy() -> impl Entropy {
-    let mut rng = StdRng::seed_from_u64(1);
-    move |d: &mut [u8]| rng.fill_bytes(d)
-}
-
-fn authorize_query(overrides: &[(&str, Option<&str>)]) -> String {
-    let mut params: Vec<(String, String)> = vec![
-        ("response_type", "code"),
-        ("client_id", PUBLIC_CLIENT),
-        ("redirect_uri", PUBLIC_REDIRECT),
-        ("scope", "openid"),
-        ("state", "rp-state-123"),
-        ("nonce", "nonce-abc"),
-        ("code_challenge_method", "S256"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
-    params.push(("code_challenge".to_string(), challenge_for(VERIFIER)));
-    for (k, v) in overrides {
-        params.retain(|(pk, _)| pk != k);
-        if let Some(val) = v {
-            params.push((k.to_string(), val.to_string()));
-        }
-    }
-    params
-        .iter()
-        .map(|(k, v)| format!("{}={}", urlenc(k), urlenc(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn location_of(resp: &CoreResponse) -> String {
-    match resp {
-        CoreResponse::Redirect(loc) => loc.clone(),
-        other => panic!("expected redirect, got {other:?}"),
-    }
-}
-
-fn json_of(resp: &CoreResponse) -> (u16, Value) {
-    match resp {
-        CoreResponse::Json { status, body, .. } => (*status, body.clone()),
-        other => panic!("expected json, got {other:?}"),
-    }
-}
-
-fn query_params(url: &str) -> HashMap<String, String> {
-    url::Url::parse(url)
-        .unwrap()
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect()
-}
-
-struct MockDiscord {
-    exchange_status: Option<u16>,
-    user: Option<DiscordUser>,
-    member_status: u16,
-}
-
-impl Default for MockDiscord {
-    fn default() -> Self {
-        Self {
-            exchange_status: None,
-            user: Some(DiscordUser {
-                id: DISCORD_USER_ID.to_string(),
-            }),
-            member_status: 200,
-        }
-    }
-}
-
-impl oidc_core::DiscordApi for MockDiscord {
-    async fn exchange_code(
-        &self,
-        _code: &str,
-        _redirect_uri: &str,
-    ) -> Result<DiscordTokenResponse, DiscordError> {
-        match self.exchange_status {
-            None => Ok(DiscordTokenResponse {
-                access_token: "discord-access-token".to_string(),
-            }),
-            Some(status) => Err(DiscordError::HttpStatus(status)),
-        }
-    }
-
-    async fn fetch_user(&self, _access_token: &str) -> Result<DiscordUser, DiscordError> {
-        self.user.clone().ok_or(DiscordError::MalformedResponse)
-    }
-
-    async fn fetch_guild_member(
-        &self,
-        _access_token: &str,
-        _guild_id: &str,
-    ) -> Result<Option<DiscordMember>, DiscordError> {
-        match self.member_status {
-            200 => Ok(Some(DiscordMember { roles: vec![] })),
-            404 => Ok(None),
-            s => Err(DiscordError::HttpStatus(s)),
-        }
-    }
-}
-
-fn basic_auth(id: &str, secret: &str) -> String {
-    let enc = base64::engine::general_purpose::STANDARD.encode(format!(
-        "{}:{}",
-        urlenc(id),
-        urlenc(secret)
-    ));
-    format!("Basic {enc}")
-}
-
-fn token_body(overrides: &[(&str, Option<&str>)]) -> String {
-    let mut params = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("code", "PLACEHOLDER".to_string()),
-        ("redirect_uri", PUBLIC_REDIRECT.to_string()),
-        ("code_verifier", VERIFIER.to_string()),
-        ("client_id", PUBLIC_CLIENT.to_string()),
-    ];
-    for (k, v) in overrides {
-        params.retain(|(pk, _)| pk != k);
-        if let Some(val) = v {
-            params.push((k, val.to_string()));
-        }
-    }
-    params
-        .iter()
-        .map(|(k, v)| format!("{}={}", urlenc(k), urlenc(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn decode_jwt(token: &str) -> (Value, Value, Vec<u8>, String) {
-    let mut parts = token.split('.');
-    let (h, p, s) = (
-        parts.next().unwrap(),
-        parts.next().unwrap(),
-        parts.next().unwrap(),
-    );
-    assert!(parts.next().is_none());
-    let header: Value = serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(h)
-            .unwrap(),
-    )
-    .unwrap();
-    let claims: Value = serde_json::from_slice(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(p)
-            .unwrap(),
-    )
-    .unwrap();
-    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s)
-        .unwrap();
-    (header, claims, sig, format!("{h}.{p}"))
-}
-
-async fn seed_transaction(store: &InMemoryStore, scope: &str) -> AuthorizationTransaction {
-    let tx = AuthorizationTransaction::new(
-        PUBLIC_CLIENT.to_string(),
-        PUBLIC_REDIRECT.to_string(),
-        scope.to_string(),
-        Some("rp-state-123".to_string()),
-        Some("nonce-abc".to_string()),
-        challenge_for(VERIFIER),
-        &mut entropy(),
-        NOW,
-    );
-    store.put_transaction(&tx).await.unwrap();
-    tx
-}
-
-/// Drives a transaction through a successful callback and returns the
-/// provider-issued plaintext authorization code.
-async fn issue_code_via_callback(
-    cfg: &Config,
-    store: &InMemoryStore,
-    client: &str,
-    redirect: &str,
-    scope: &str,
-) -> String {
-    let tx = AuthorizationTransaction::new(
-        client.to_string(),
-        redirect.to_string(),
-        scope.to_string(),
-        Some("rp-state-123".to_string()),
-        Some("nonce-abc".to_string()),
-        challenge_for(VERIFIER),
-        &mut entropy(),
-        NOW,
-    );
-    store.put_transaction(&tx).await.unwrap();
-    let q = format!("code=discord-auth-code&state={}", tx.discord_oauth_state);
-    let resp = handle_callback(&q, cfg, store, &MockDiscord::default(), &mut entropy(), NOW).await;
-    query_params(&location_of(&resp))["code"].clone()
-}
+use support::*;
 
 // ---------- /authorize ----------
 
@@ -328,7 +27,7 @@ async fn issue_code_via_callback(
 fn authorize_rejects_unknown_client() {
     let cfg = test_config();
     let q = authorize_query(&[("client_id", Some("nobody"))]);
-    match validate_authorize_request(&q, &cfg) {
+    match block_on(validate_authorize_request(&q, &cfg)) {
         AuthorizeVerdict::RenderError { status, .. } => assert_eq!(status, 400),
         other => panic!("expected render error, got {other:?}"),
     }
@@ -344,7 +43,7 @@ fn authorize_rejects_nonexact_redirect_uri() {
         "https://rp-a.ojiverse.example.evil.com/auth/callback",
     ] {
         let q = authorize_query(&[("redirect_uri", Some(uri))]);
-        match validate_authorize_request(&q, &cfg) {
+        match block_on(validate_authorize_request(&q, &cfg)) {
             AuthorizeVerdict::RenderError { status, .. } => assert_eq!(status, 400),
             other => panic!("expected render error for {uri}, got {other:?}"),
         }
@@ -355,7 +54,7 @@ fn authorize_rejects_nonexact_redirect_uri() {
 fn authorize_rejects_missing_openid_scope() {
     let cfg = test_config();
     let q = authorize_query(&[("scope", Some("profile"))]);
-    match validate_authorize_request(&q, &cfg) {
+    match block_on(validate_authorize_request(&q, &cfg)) {
         AuthorizeVerdict::RedirectError {
             redirect_uri,
             code,
@@ -377,7 +76,7 @@ fn authorize_rejects_scope_outside_allowlist() {
     // client's `allowed_scopes` cannot contain it.
     for scope in ["openid email", "openid profile"] {
         let q = authorize_query(&[("scope", Some(scope))]);
-        match validate_authorize_request(&q, &cfg) {
+        match block_on(validate_authorize_request(&q, &cfg)) {
             AuthorizeVerdict::RedirectError { code, .. } => {
                 assert_eq!(code, OAuthErrorCode::InvalidScope, "scope: {scope}")
             }
@@ -390,7 +89,7 @@ fn authorize_rejects_scope_outside_allowlist() {
 fn authorize_rejects_wrong_response_type() {
     let cfg = test_config();
     let q = authorize_query(&[("response_type", Some("token"))]);
-    match validate_authorize_request(&q, &cfg) {
+    match block_on(validate_authorize_request(&q, &cfg)) {
         AuthorizeVerdict::RedirectError { code, .. } => {
             assert_eq!(code, OAuthErrorCode::UnsupportedResponseType)
         }
@@ -415,7 +114,7 @@ fn authorize_rejects_bad_pkce() {
             q
         },
     ] {
-        match validate_authorize_request(&q, &cfg) {
+        match block_on(validate_authorize_request(&q, &cfg)) {
             AuthorizeVerdict::RedirectError { code, .. } => {
                 assert_eq!(code, OAuthErrorCode::InvalidRequest, "query: {q}")
             }
@@ -429,7 +128,14 @@ fn authorize_happy_path_redirects_to_discord() {
     let cfg = test_config();
     let store = InMemoryStore::new();
     let q = authorize_query(&[]);
-    let resp = block_on(handle_authorize(&q, &cfg, &store, &mut entropy(), NOW));
+    let resp = block_on(handle_authorize(
+        &q,
+        &cfg,
+        &store,
+        &cfg,
+        &mut entropy(),
+        NOW,
+    ));
     let loc = location_of(&resp);
     assert!(loc.starts_with("https://discord.com/oauth2/authorize?"));
     let p = query_params(&loc);
@@ -449,7 +155,7 @@ fn authorize_rejects_duplicate_params() {
     let cfg = test_config();
     let mut q = authorize_query(&[]);
     q.push_str("&nonce=second");
-    match validate_authorize_request(&q, &cfg) {
+    match block_on(validate_authorize_request(&q, &cfg)) {
         AuthorizeVerdict::RedirectError { code, .. } => {
             assert_eq!(code, OAuthErrorCode::InvalidRequest)
         }
@@ -465,7 +171,7 @@ fn authorize_ignores_unrecognized_parameters() {
     let cfg = test_config();
     let mut q = authorize_query(&[]);
     q.push_str("&login_hint=u&resource=https://api.example&login_hint=again");
-    match validate_authorize_request(&q, &cfg) {
+    match block_on(validate_authorize_request(&q, &cfg)) {
         AuthorizeVerdict::Proceed(_) => {}
         other => panic!("expected proceed, got {other:?}"),
     }
@@ -478,7 +184,7 @@ fn authorize_ignores_unrecognized_parameters() {
 // reaches Discord.
 
 fn expect_redirect_error(q: &str, cfg: &Config, code: OAuthErrorCode) {
-    match validate_authorize_request(q, cfg) {
+    match block_on(validate_authorize_request(q, cfg)) {
         AuthorizeVerdict::RedirectError {
             redirect_uri,
             code: c,
@@ -500,7 +206,14 @@ fn authorize_prompt_none_fails_closed() {
     let q = authorize_query(&[("prompt", Some("none"))]);
     expect_redirect_error(&q, &cfg, OAuthErrorCode::LoginRequired);
     // No transaction is created and nothing redirects to Discord.
-    let resp = block_on(handle_authorize(&q, &cfg, &store, &mut entropy(), NOW));
+    let resp = block_on(handle_authorize(
+        &q,
+        &cfg,
+        &store,
+        &cfg,
+        &mut entropy(),
+        NOW,
+    ));
     let loc = location_of(&resp);
     assert!(loc.starts_with(PUBLIC_REDIRECT));
     let p = query_params(&loc);
@@ -539,7 +252,14 @@ fn authorize_prompt_consent_forwards_to_discord() {
     let cfg = test_config();
     let store = InMemoryStore::new();
     let q = authorize_query(&[("prompt", Some("consent"))]);
-    let resp = block_on(handle_authorize(&q, &cfg, &store, &mut entropy(), NOW));
+    let resp = block_on(handle_authorize(
+        &q,
+        &cfg,
+        &store,
+        &cfg,
+        &mut entropy(),
+        NOW,
+    ));
     let loc = location_of(&resp);
     assert!(loc.starts_with("https://discord.com/oauth2/authorize?"));
     assert_eq!(query_params(&loc)["prompt"], "consent");
@@ -550,7 +270,7 @@ fn authorize_prompt_unknown_values_ignored() {
     let cfg = test_config();
     for prompt in ["create", "consent create"] {
         let q = authorize_query(&[("prompt", Some(prompt))]);
-        match validate_authorize_request(&q, &cfg) {
+        match block_on(validate_authorize_request(&q, &cfg)) {
             AuthorizeVerdict::Proceed(_) => {}
             other => panic!("expected proceed for prompt={prompt}, got {other:?}"),
         }
@@ -587,6 +307,7 @@ fn callback_rejects_unknown_state() {
         "code=x&state=unknown-state",
         &cfg,
         &store,
+        &cfg,
         &MockDiscord::default(),
         &mut entropy(),
         NOW,
@@ -606,6 +327,7 @@ fn callback_forwards_discord_error_with_rp_state() {
         &format!("error=access_denied&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &MockDiscord::default(),
         &mut entropy(),
         NOW,
@@ -620,6 +342,7 @@ fn callback_forwards_discord_error_with_rp_state() {
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &MockDiscord::default(),
         &mut entropy(),
         NOW,
@@ -636,6 +359,7 @@ fn callback_expired_transaction_redirects_error() {
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &MockDiscord::default(),
         &mut entropy(),
         NOW + 601,
@@ -658,6 +382,7 @@ fn callback_exchange_failure_is_server_error() {
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &discord,
         &mut entropy(),
         NOW,
@@ -680,6 +405,7 @@ fn callback_rejects_malformed_user_id() {
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &discord,
         &mut entropy(),
         NOW,
@@ -700,6 +426,7 @@ fn callback_denies_non_guild_member() {
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &discord,
         &mut entropy(),
         NOW,
@@ -722,6 +449,7 @@ fn callback_guild_api_failure_fails_closed() {
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &discord,
         &mut entropy(),
         NOW,
@@ -738,6 +466,7 @@ fn callback_success_issues_bound_code() {
         &format!("code=x&state={}", tx.discord_oauth_state),
         &cfg,
         &store,
+        &cfg,
         &MockDiscord::default(),
         &mut entropy(),
         NOW,
@@ -775,6 +504,7 @@ fn token_full_flow_issues_valid_id_token() {
     let code = block_on(issue_code_via_callback(
         &cfg,
         &store,
+        &cfg,
         PUBLIC_CLIENT,
         PUBLIC_REDIRECT,
         "openid",
@@ -785,6 +515,7 @@ fn token_full_flow_issues_valid_id_token() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -839,6 +570,7 @@ fn token_rejects_wrong_grant_type() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -859,6 +591,7 @@ fn token_rejects_unknown_code() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -874,6 +607,7 @@ fn token_rejects_expired_code() {
     let code = block_on(issue_code_via_callback(
         &cfg,
         &store,
+        &cfg,
         PUBLIC_CLIENT,
         PUBLIC_REDIRECT,
         "openid",
@@ -884,6 +618,7 @@ fn token_rejects_expired_code() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW + 61,
@@ -899,6 +634,7 @@ fn token_rejects_reused_code() {
     let code = block_on(issue_code_via_callback(
         &cfg,
         &store,
+        &cfg,
         PUBLIC_CLIENT,
         PUBLIC_REDIRECT,
         "openid",
@@ -909,6 +645,7 @@ fn token_rejects_reused_code() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -919,6 +656,7 @@ fn token_rejects_reused_code() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -936,6 +674,7 @@ fn token_rejects_wrong_client() {
     let code = block_on(issue_code_via_callback(
         &cfg,
         &store,
+        &cfg,
         PUBLIC_CLIENT,
         PUBLIC_REDIRECT,
         "openid",
@@ -950,6 +689,7 @@ fn token_rejects_wrong_client() {
         Some(&basic_auth(CONF_CLIENT, CONF_SECRET)),
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -965,6 +705,7 @@ fn token_rejects_wrong_redirect_uri() {
     let code = block_on(issue_code_via_callback(
         &cfg,
         &store,
+        &cfg,
         PUBLIC_CLIENT,
         PUBLIC_REDIRECT,
         "openid",
@@ -978,6 +719,7 @@ fn token_rejects_wrong_redirect_uri() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -993,6 +735,7 @@ fn token_rejects_wrong_verifier() {
     let code = block_on(issue_code_via_callback(
         &cfg,
         &store,
+        &cfg,
         PUBLIC_CLIENT,
         PUBLIC_REDIRECT,
         "openid",
@@ -1009,6 +752,7 @@ fn token_rejects_wrong_verifier() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -1030,6 +774,7 @@ fn token_confidential_requires_basic_auth() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -1060,6 +805,7 @@ fn token_rejects_bad_secret() {
         Some(&basic_auth(CONF_CLIENT, "wrong-secret-value")),
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -1077,6 +823,7 @@ fn token_confidential_full_flow() {
     let code = block_on(issue_code_via_callback(
         &cfg,
         &store,
+        &cfg,
         CONF_CLIENT,
         CONF_REDIRECT,
         "openid",
@@ -1091,6 +838,7 @@ fn token_confidential_full_flow() {
         Some(&basic_auth(CONF_CLIENT, CONF_SECRET)),
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -1115,6 +863,7 @@ fn token_rejects_unknown_client_body() {
         None,
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -1135,6 +884,7 @@ fn token_rejects_basic_with_public_client() {
         Some(&basic_auth(PUBLIC_CLIENT, "anything")),
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,
@@ -1153,6 +903,7 @@ fn token_rejects_client_id_mismatch_basic_vs_body() {
         Some(&basic_auth(CONF_CLIENT, CONF_SECRET)),
         &cfg,
         &store,
+        &cfg,
         &signer,
         &mut entropy(),
         NOW,

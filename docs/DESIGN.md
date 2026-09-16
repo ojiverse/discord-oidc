@@ -151,11 +151,16 @@ API error、rate limit、判定不能な response の場合は fail-open せず 
 
 ## 4. OIDC Client model
 
-### 4.1 Static client registry
+### 4.1 Client registry: static + dynamic の 2 層構成
 
-初期実装では Dynamic Client Registration を実装しません。
+Client registry は read-only の static registry と、admin API で管理する dynamic registry の 2 層です。
 
-少数の trusted OIDC Client を明示的に設定します。
+- **static registry**: `OIDC_CLIENTS_JSON` に設定する bootstrap / legacy client。deploy 時にのみ変更でき、admin API からの一切の変更は `409 static_client_immutable` で拒否されます。
+- **dynamic registry**: `ClientRegistryState` Durable Object (SQLite-backed) に永続化される実行時 registry。`POST /admin/clients` などの admin endpoint 経由でのみ変更します。
+
+`client_id` の resolution は常に static registry を先に検索し、存在しない場合に dynamic registry を検索します。dynamic `client_id` は `oji_` + 128 bit random (base64url) であり、static client との衝突は generation 時に skip します。
+
+RFC 7591 の Dynamic Client Registration (公開 self-service endpoint) は実装しません。dynamic registry への登録は必ず運用者が admin API 経由で行います。
 
 概念例:
 
@@ -190,7 +195,50 @@ OIDC_CLIENTS_JSON=[...]
 
 confidential client secret は通常の環境変数ではなく Cloudflare Worker Secret 等の secret storage を利用します。
 
-### 4.2 Redirect URI
+### 4.2 Dynamic client record
+
+dynamic registry の各 client は次の record として `client:<client_id>` key で永続化されます。
+
+```text
+client_id                        # oji_<base64url(128bit)>。immutable
+display_name                     # 1..=128 bytes (trim 後)。mutable
+owner_discord_user_id            # OJIverse 内の連絡先 (Discord snowflake)。mutable
+redirect_uris                    # 1..=16 件、完全一致、重複不可。mutable
+client_type                      # public | confidential。immutable
+token_endpoint_auth_method       # type から導出: none | client_secret_basic。immutable
+allowed_scopes                   # 固定 ["openid"]。immutable
+status                           # active | disabled。enable/disable endpoint のみ
+current_secret_hash              # base64url(SHA-256(secret))。confidential のみ
+previous_secret_hash             # 直前の rotated-out secret hash
+previous_secret_valid_until      # 上記の受付期限 (unix seconds)
+created_at / updated_at / disabled_at
+```
+
+policy は固定です。public client は `token_endpoint_auth_method=none`、confidential client は `client_secret_basic` であり、どちらも scope は `openid` のみです。
+
+`status=disabled` の client は `/authorize` (redirect せずその場で error render)、callback (`unauthorized_client`)、`/token` (`invalid_client`) のすべてで拒否されます。`/authorize` 通過後に disable された client は、Discord code の交換も provider code の発行も行われません。code を発行済みであっても `/token` で client authentication が再評価されるため、disable 後の exchange は失敗します。
+
+confidential client の secret は server 側で 256 bit random として生成され、plaintext は create / rotate の response で一度だけ返されます。storage には SHA-256 hash のみ保存されます。rotation 時、旧 secret は 600 秒の overlap window 中のみ受け付け、2 回目の rotation でさらに古い secret は即座に失効します。public client に secret は存在せず、rotation は `client_has_no_secret` で拒否されます。
+
+### 4.3 Admin API
+
+dynamic registry への操作は private control plane として提供し、public OIDC surface とは分離します。
+
+```text
+POST /admin/clients                       # 登録 (confidential は secret を一度だけ返す)
+GET  /admin/clients                       # static + dynamic の一覧
+GET  /admin/clients/{client_id}           # 単体取得 (static は source=static)
+PUT  /admin/clients/{client_id}           # mutable metadata の全置換
+POST /admin/clients/{client_id}/disable   # 即時拒否へ移行 (idempotent)
+POST /admin/clients/{client_id}/enable    # active へ復帰 (idempotent)
+POST /admin/clients/{client_id}/rotate-secret  # confidential のみ
+```
+
+hard delete は存在しません。authentication は `Authorization: Bearer <OIDC_ADMIN_API_TOKEN>` で、token は constant-time 比較します。未設定の場合は全 request が `401` で fail closed です。すべての response は `Cache-Control: no-store` で、CORS header を返しません。
+
+error は `{"error": "...", "error_description": "..."}` の JSON で、`unauthorized` (401)、`invalid_request` (400)、`client_not_found` (404)、`static_client_immutable` (409)、`client_has_no_secret` (400)、`storage_error` (500) を使い分けます。storage や crypto の内部詳細は response に含めません。
+
+### 4.4 Redirect URI
 
 `redirect_uri` は登録値との **完全一致** で検証します。
 
@@ -200,7 +248,7 @@ confidential client secret は通常の環境変数ではなく Cloudflare Worke
 - wildcard redirect URI
 - request から任意 URI を受け入れること
 
-### 4.3 Audience
+### 4.5 Audience
 
 `aud` を Provider 全体の固定値にはしません。
 
@@ -233,6 +281,8 @@ GET  /oauth/discord/callback
 POST /token
 GET  /jwks.json
 ```
+
+public surface とは別に、認証済み運用者のみが利用する admin API (`/admin/clients`, 4.3 参照) があります。
 
 必要に応じて追加:
 
@@ -477,12 +527,17 @@ Cloudflare Worker
    ├ /authorize
    ├ /oauth/discord/callback
    ├ /token
-   └ /jwks.json
+   ├ /jwks.json
+   └ /admin/clients (bearer auth)
           │
-          ▼
-AuthorizationState Durable Object
+          ├─────────────────────────┐
+          ▼                         ▼
+AuthorizationState DO    ClientRegistryState DO
+(短期 state)              (dynamic client registry)
 SQLite-backed storage
 ```
+
+`ClientRegistryState` は Worker の stub 経由でのみアクセスされ、直接の public endpoint は持ちません。registry の validation / transition 規則はすべて `oidc-core` 側にあり、DO は serialized な read-modify-write の storage adapter として動きます。
 
 ### 8.1 Worker
 
@@ -499,9 +554,14 @@ Worker の責務:
 
 SQLite-backed Durable Object は短期 state の強整合性と atomic consume に利用します。
 
-初期構成では deployment 内に 1 つの authorization-state authority を持つ単純なモデルで十分です。
+deployment 内に 2 つの singleton object を持ちます。
 
-保持対象候補:
+- `AuthorizationState`: authorization transaction と authorization code (短期 state)
+- `ClientRegistryState`: dynamic client record (4.2)
+
+初期構成では単一 authority の単純なモデルで十分です。
+
+`AuthorizationState` の保持対象:
 
 ```text
 authorization_transactions
@@ -509,11 +569,17 @@ authorization_codes
 access_tokens (userinfo を実装する場合)
 ```
 
+`ClientRegistryState` の保持対象:
+
+```text
+client:<client_id> -> DynamicClientRecord
+```
+
 長期 user database は持ちません。
 
 Discord user profile を user directory として複製することも目的ではありません。
 
-expired な transaction / code は DO alarm による periodic sweep で削除します。
+expired な transaction / code は DO alarm による periodic sweep で削除します。client record に TTL はなく、無効化は `status=disabled` で表現します (hard delete はありません)。
 
 ### 8.3 Signing keys
 
@@ -560,7 +626,8 @@ Discord application には `{OIDC_ISSUER_URL}/oauth/discord/callback` を redire
 ```text
 DISCORD_CLIENT_SECRET
 OIDC_SIGNING_PRIVATE_KEY
-OIDC_CLIENT_SECRETS_JSON  # confidential client をサポートする場合
+OIDC_ADMIN_API_TOKEN      # /admin/clients の bearer token。未設定なら admin API は 401 で fail closed
+OIDC_CLIENT_SECRETS_JSON  # static confidential client の secret (dynamic client secret は provider が生成・hash 保存)
 ```
 
 ### 9.3 `OIDC_ISSUER_URL` validation
@@ -611,7 +678,7 @@ CI/CD credential は可能な範囲で repository ごとに scope を分離し�
 
 初期設計では以下を対象外とします。
 
-- Dynamic Client Registration
+- RFC 7591 Dynamic Client Registration (公開 self-service registration。運用者が行う admin API 経由の登録は §4.3 の通り実装対象)
 - pairwise subject
 - OP 側の login session / Single Sign-On(authorization は毎回 Discord OAuth2 を経由します)
 - Refresh token / `offline_access` scope

@@ -1,10 +1,12 @@
 //! Static OIDC client registry.
 //!
-//! Dynamic Client Registration is out of scope; a small set of trusted clients
-//! is configured explicitly via `OIDC_CLIENTS_JSON` (public settings) and
-//! `OIDC_CLIENT_SECRETS_JSON` (secret storage).
+//! A small set of trusted clients is configured explicitly via
+//! `OIDC_CLIENTS_JSON` (public settings) and `OIDC_CLIENT_SECRETS_JSON`
+//! (secret storage). Static clients are read-only legacy/bootstrap entries;
+//! runtime-managed clients live in the dynamic registry (see
+//! `crate::registry`), and client lookup resolves static first.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Scopes this provider can grant. Mirrors `scopes_supported` in discovery.
@@ -13,7 +15,7 @@ use url::Url;
 pub const SUPPORTED_SCOPES: &[&str] = &["openid"];
 
 /// Client classification (`type` in `OIDC_CLIENTS_JSON`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientType {
     /// Public client (native app, CLI). No secret; PKCE is the protection.
@@ -24,7 +26,7 @@ pub enum ClientType {
 }
 
 /// Authentication method a client uses at the token endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenEndpointAuthMethod {
     /// No client authentication (public clients only).
     #[serde(rename = "none")]

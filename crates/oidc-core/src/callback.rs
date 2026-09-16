@@ -11,6 +11,7 @@ use crate::code::issue_code;
 use crate::config::Config;
 use crate::discord::DiscordApi;
 use crate::error::{error_page, OAuthErrorCode};
+use crate::resolver::ClientResolver;
 use crate::response::CoreResponse;
 use crate::store::{AuthorizationStore, TakeTransaction};
 use crate::transaction::AuthorizationTransaction;
@@ -52,10 +53,21 @@ fn sanitize_upstream_error(code: &str) -> OAuthErrorCode {
 /// Full Discord callback handler.
 ///
 /// `query` is the raw callback query string (`code`/`state`/`error`).
-pub async fn handle_callback<S: AuthorizationStore, D: DiscordApi, E: Entropy>(
+///
+/// The transaction's client is re-resolved after the transaction is taken:
+/// a client disabled between `/authorize` and this callback receives no
+/// further authentication result — no Discord token exchange runs, no
+/// provider code is issued, and no RP redirect happens.
+pub async fn handle_callback<
+    S: AuthorizationStore,
+    D: DiscordApi,
+    E: Entropy,
+    R: ClientResolver + ?Sized,
+>(
     query: &str,
     cfg: &Config,
     store: &S,
+    resolver: &R,
     discord: &D,
     entropy: &mut E,
     now: i64,
@@ -99,6 +111,24 @@ pub async fn handle_callback<S: AuthorizationStore, D: DiscordApi, E: Entropy>(
             return render(500, "server_error", "authorization storage failure");
         }
     };
+
+    // Re-resolve the transaction's client before any upstream work: once a
+    // client is disabled, no authentication result — including an upstream
+    // error — may reach the RP. The provider renders a local error page
+    // instead of redirecting to the (no longer trusted) redirect_uri.
+    match resolver.find_client(&tx.oidc_client_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return render(
+                403,
+                "unauthorized_client",
+                "client is disabled or no longer registered",
+            );
+        }
+        Err(_) => {
+            return render(500, "server_error", "client registry failure");
+        }
+    }
 
     if let Some(upstream_error) = error {
         return redirect_error(

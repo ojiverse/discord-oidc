@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use serde_json::json;
-use subtle::ConstantTimeEq;
 use url::form_urlencoded;
 
 use crate::client::{ClientConfig, ClientType, TokenEndpointAuthMethod};
@@ -17,6 +16,7 @@ use crate::code::{hash_presented_code, ExchangeCheck};
 use crate::config::Config;
 use crate::error::{ErrorBody, OAuthErrorCode};
 use crate::jwt::{at_hash, encode_claims, IdTokenClaims, IdTokenSigner};
+use crate::resolver::ClientResolver;
 use crate::response::CoreResponse;
 use crate::store::AuthorizationStore;
 use crate::util::{random_token, Entropy};
@@ -113,14 +113,19 @@ fn form_decode_part(s: &str) -> Option<String> {
 /// Authenticates the client at the token endpoint.
 ///
 /// - `Basic` header present: must belong to a registered confidential client
-///   using `client_secret_basic`; secret compared in constant time. A body
-///   `client_id` that disagrees fails authentication.
+///   using `client_secret_basic`; the secret is verified by the resolver in
+///   constant time (current hash, or previous hash inside its rotation
+///   window, for dynamic clients). A body `client_id` that disagrees fails
+///   authentication.
 /// - No header: body `client_id` must name a registered *public* client.
-fn authenticate_client<'a>(
+///
+/// Unknown and disabled clients fail identically as `invalid_client`.
+async fn authenticate_client<R: ClientResolver + ?Sized>(
     params: &Params,
     auth_header: Option<&str>,
-    cfg: &'a Config,
-) -> Result<&'a ClientConfig, CoreResponse> {
+    resolver: &R,
+    now: i64,
+) -> Result<ClientConfig, CoreResponse> {
     let body_client_id = single(params, "client_id").ok().flatten();
 
     if let Some(auth) = auth_header {
@@ -133,28 +138,52 @@ fn authenticate_client<'a>(
         if body_client_id.is_some_and(|id| id != client_id) {
             return Err(invalid_client());
         }
-        let Some(client) = cfg.clients.find(&client_id) else {
-            return Err(invalid_client());
+        let client = match resolver.find_client(&client_id).await {
+            Ok(Some(client)) => client,
+            Ok(None) => return Err(invalid_client()),
+            Err(_) => {
+                return Err(json_error(
+                    500,
+                    OAuthErrorCode::ServerError,
+                    None,
+                    Vec::new(),
+                ))
+            }
         };
         if client.client_type != ClientType::Confidential
             || client.token_endpoint_auth_method != TokenEndpointAuthMethod::ClientSecretBasic
         {
             return Err(invalid_client());
         }
-        let Some(expected) = cfg.client_secret(&client_id) else {
-            return Err(invalid_client());
+        return match resolver
+            .verify_client_secret(&client_id, &secret, now)
+            .await
+        {
+            Ok(true) => Ok(client),
+            Ok(false) => Err(invalid_client()),
+            Err(_) => Err(json_error(
+                500,
+                OAuthErrorCode::ServerError,
+                None,
+                Vec::new(),
+            )),
         };
-        if !bool::from(expected.as_bytes().ct_eq(secret.as_bytes())) {
-            return Err(invalid_client());
-        }
-        return Ok(client);
     }
 
     let Some(client_id) = body_client_id else {
         return Err(invalid_client());
     };
-    let Some(client) = cfg.clients.find(client_id) else {
-        return Err(invalid_client());
+    let client = match resolver.find_client(client_id).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return Err(invalid_client()),
+        Err(_) => {
+            return Err(json_error(
+                500,
+                OAuthErrorCode::ServerError,
+                None,
+                Vec::new(),
+            ))
+        }
     };
     // Public clients carry no secret; confidential clients must use Basic.
     if client.client_type != ClientType::Public
@@ -167,11 +196,18 @@ fn authenticate_client<'a>(
 
 /// Full `/token` handler. `form_body` must already be known to be
 /// `application/x-www-form-urlencoded` (the adapter checks Content-Type).
-pub async fn handle_token<S: AuthorizationStore, E: Entropy, G: IdTokenSigner>(
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_token<
+    S: AuthorizationStore,
+    E: Entropy,
+    G: IdTokenSigner,
+    R: ClientResolver + ?Sized,
+>(
     form_body: &str,
     auth_header: Option<&str>,
     cfg: &Config,
     store: &S,
+    resolver: &R,
     signer: &G,
     entropy: &mut E,
     now: i64,
@@ -197,7 +233,7 @@ pub async fn handle_token<S: AuthorizationStore, E: Entropy, G: IdTokenSigner>(
         _ => return invalid_request("invalid grant_type"),
     }
 
-    let client = match authenticate_client(&params, auth_header, cfg) {
+    let client = match authenticate_client(&params, auth_header, resolver, now).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
