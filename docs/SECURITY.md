@@ -522,7 +522,7 @@ security-sensitive dependency は lockfile で固定し、Renovate / Dependabot 
 - unknown client rejection
 - exact redirect URI matching
 - missing `openid` scope
-- scope outside the client allowlist
+- scopes outside the client allowlist are dropped; only the granted intersection is issued (token response `scope` echoes it)
 - invalid response type
 - invalid/missing PKCE
 - unrecognized parameters ignored

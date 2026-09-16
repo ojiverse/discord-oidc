@@ -340,7 +340,7 @@ Provider は最初に以下を検証します。
 2. `redirect_uri` が完全一致で allowlist 済み
 3. `response_type=code`
 4. `openid` scope が存在
-5. request された scope が client の `allowed_scopes` の subset である
+5. request された scope のうち client の `allowed_scopes` に含まれない値は無視し、intersection を granted scope とします (RFC 6749 §3.3)。`allowed_scopes` 外の値で fail closed はしません — Cloudflare Access の generic OIDC connector のように `openid email profile` を常に送る client と interoperate するためです。granted scope は token response の `scope` field で client に通知します
 6. PKCE parameter が正しい(`code_challenge` は 43–128 文字の base64url、`code_challenge_method=S256`)
 7. request parameter のサイズ・形式が妥当
 
