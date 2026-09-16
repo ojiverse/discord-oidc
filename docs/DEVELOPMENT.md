@@ -97,6 +97,11 @@ public internet — only the Worker stub calls it.
 
 ## Admin API (RP onboarding)
 
+For the end-to-end operator procedure — what to collect from the
+developer, sanity checks, credential hand-over, and lifecycle — see
+[RP_ONBOARDING.md](RP_ONBOARDING.md). This section is the command
+reference.
+
 Operators register and manage dynamic OIDC clients through the admin API.
 All requests need `Authorization: Bearer $OIDC_ADMIN_API_TOKEN`; responses
 are JSON, `Cache-Control: no-store`, with no CORS headers. Confidential

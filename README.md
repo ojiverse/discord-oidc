@@ -122,6 +122,8 @@ registration の流れ:
 2. 運用者は admin API で client を登録し、発行された `client_id` (confidential の場合は一度だけ表示される `client_secret`) を developer へ渡す
 3. developer は `client_id` (+ `client_secret`) と issuer URL で通常の OIDC RP を構成する
 
+運用者向けの runbook (依頼内容の確認・登録・credential の受け渡し・ライフサイクル操作) は [docs/RP_ONBOARDING.md](./docs/RP_ONBOARDING.md) を参照してください。
+
 ## Target platform
 
 Cloudflare 上での運用を前提とします。
