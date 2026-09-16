@@ -47,7 +47,8 @@ pub struct ValidatedAuthorize {
     pub client_id: String,
     /// Registered redirect URI (exact match).
     pub redirect_uri: String,
-    /// Requested scope string (a subset of the client's `allowed_scopes`).
+    /// Granted scope string: the intersection of the requested scopes
+    /// and the client's `allowed_scopes`.
     pub scope: String,
     /// RP `state` to echo back.
     pub rp_state: Option<String>,
@@ -195,11 +196,17 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
     if !requested.contains(&"openid") {
         return err(OAuthErrorCode::InvalidScope, "openid scope required");
     }
-    if requested
-        .iter()
-        .any(|s| !client.allowed_scopes.iter().any(|a| a == s))
-    {
-        return err(OAuthErrorCode::InvalidScope, "scope not allowed for client");
+    // Grant the intersection of requested and allowed scopes; values the
+    // provider cannot grant are ignored (RFC 6749 §3.3, OIDC Core
+    // 3.1.2.1). Some clients — e.g. Cloudflare Access generic OIDC —
+    // unconditionally request `openid email profile`; failing closed
+    // would make such conforming clients unusable. The granted subset is
+    // what the token response echoes in its `scope` field.
+    let mut granted: Vec<&str> = Vec::new();
+    for s in &requested {
+        if client.allowed_scopes.iter().any(|a| a == s) && !granted.contains(s) {
+            granted.push(s);
+        }
     }
 
     match single(&params, "code_challenge_method") {
@@ -278,7 +285,7 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
     AuthorizeVerdict::Proceed(ValidatedAuthorize {
         client_id: client.client_id.clone(),
         redirect_uri: redirect_uri.to_string(),
-        scope: requested.join(" "),
+        scope: granted.join(" "),
         rp_state: state,
         nonce,
         code_challenge,

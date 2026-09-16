@@ -19,7 +19,7 @@ pub struct AuthorizationTransaction {
     pub oidc_client_id: String,
     /// Exact-match validated redirect URI of the client.
     pub redirect_uri: String,
-    /// Requested scope string as received.
+    /// Granted scope string (requested ∩ client `allowed_scopes`).
     pub requested_scope: String,
     /// RP-provided `state`, echoed back to the RP.
     pub rp_state: Option<String>,

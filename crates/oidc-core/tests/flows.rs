@@ -371,17 +371,21 @@ fn authorize_rejects_missing_openid_scope() {
 }
 
 #[test]
-fn authorize_rejects_scope_outside_allowlist() {
+fn authorize_grants_intersection_of_allowed_scopes() {
+    // Scopes outside the client's `allowed_scopes` are dropped, not
+    // rejected: RFC 6749 §3.3 permits ignoring ungrantable scopes and
+    // OIDC Core 3.1.2.1 allows dropping values the provider does not
+    // understand. Cloudflare Access's generic OIDC connector always
+    // requests `openid email profile`, so failing closed would make it
+    // unusable. The granted subset is what the token response echoes.
     let cfg = test_config();
-    // `profile` is also rejected: only `openid` is supported and the
-    // client's `allowed_scopes` cannot contain it.
-    for scope in ["openid email", "openid profile"] {
+    for scope in ["openid email", "openid profile", "openid email profile"] {
         let q = authorize_query(&[("scope", Some(scope))]);
         match validate_authorize_request(&q, &cfg) {
-            AuthorizeVerdict::RedirectError { code, .. } => {
-                assert_eq!(code, OAuthErrorCode::InvalidScope, "scope: {scope}")
+            AuthorizeVerdict::Proceed(v) => {
+                assert_eq!(v.scope, "openid", "scope: {scope}")
             }
-            other => panic!("expected redirect invalid_scope for {scope}, got {other:?}"),
+            other => panic!("expected proceed for {scope}, got {other:?}"),
         }
     }
 }
@@ -826,6 +830,43 @@ fn token_full_flow_issues_valid_id_token() {
     // The deterministic TestSigner binds the signature to the signing input.
     let expected_sig = Sha256::digest(format!("test-key-1:{input}").as_bytes());
     assert_eq!(sig.as_slice(), expected_sig.as_slice());
+}
+
+#[test]
+fn token_echoes_only_granted_scope_end_to_end() {
+    // Full path: authorize -> Discord callback -> token. A client that
+    // requests `openid email profile` (e.g. Cloudflare Access generic
+    // OIDC) must receive a token whose `scope` reports only what was
+    // granted, per RFC 6749 §3.3.
+    let cfg = test_config();
+    let store = InMemoryStore::new();
+    let signer = test_signer();
+    let q = authorize_query(&[("scope", Some("openid email profile"))]);
+    let resp = block_on(handle_authorize(&q, &cfg, &store, &mut entropy(), NOW));
+    let discord_state = query_params(&location_of(&resp))["state"].clone();
+    let cb = format!("code=discord-auth-code&state={discord_state}");
+    let resp = block_on(handle_callback(
+        &cb,
+        &cfg,
+        &store,
+        &MockDiscord::default(),
+        &mut entropy(),
+        NOW,
+    ));
+    let code = query_params(&location_of(&resp))["code"].clone();
+    let body = token_body(&[("code", Some(&code))]);
+    let resp = block_on(handle_token(
+        &body,
+        None,
+        &cfg,
+        &store,
+        &signer,
+        &mut entropy(),
+        NOW,
+    ));
+    let (status, json) = json_of(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(json["scope"], "openid");
 }
 
 #[test]
