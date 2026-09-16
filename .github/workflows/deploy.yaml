@@ -52,7 +52,8 @@ jobs:
 
       # Loads every variable in the linked 1Password Environment as env vars
       # (CLOUDFLARE_API_TOKEN, DISCORD_CLIENT_SECRET, OIDC_SIGNING_PRIVATE_KEY,
-      # optional OIDC_CLIENT_SECRETS_JSON). See docs/DEVELOPMENT.md.
+      # optional OIDC_CLIENT_SECRETS_JSON, optional OIDC_ADMIN_API_TOKEN).
+      # See docs/DEVELOPMENT.md.
       - name: Load secrets from 1Password
         uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2 # v5.0.1
         with:
@@ -66,17 +67,23 @@ jobs:
 
       # secret bulk creates/updates the listed secrets and leaves others
       # untouched. Runs after deploy so the Worker is guaranteed to exist.
+      # OIDC_ADMIN_API_TOKEN is required in production: omitting it would
+      # silently leave a previously-synced token on the Worker (secret bulk
+      # never deletes), so the step fails fast instead.
       - name: Sync worker secrets
         run: |
           : "${DISCORD_CLIENT_SECRET:?missing from 1Password environment}"
           : "${OIDC_SIGNING_PRIVATE_KEY:?missing from 1Password environment}"
+          : "${OIDC_ADMIN_API_TOKEN:?missing from 1Password environment}"
           jq -n \
             --arg discord "$DISCORD_CLIENT_SECRET" \
             --arg key "$OIDC_SIGNING_PRIVATE_KEY" \
             --arg clients "${OIDC_CLIENT_SECRETS_JSON:-}" \
+            --arg admin "$OIDC_ADMIN_API_TOKEN" \
             '{
                DISCORD_CLIENT_SECRET: $discord,
-               OIDC_SIGNING_PRIVATE_KEY: $key
+               OIDC_SIGNING_PRIVATE_KEY: $key,
+               OIDC_ADMIN_API_TOKEN: $admin
              } + (if $clients == "" then {}
                   else { OIDC_CLIENT_SECRETS_JSON: $clients } end)' \
             | npx --yes wrangler@4.131.2 secret bulk

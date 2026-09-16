@@ -29,6 +29,7 @@ OIDC_SIGNING_KEY_ID = "prod-key-1"
 #   DISCORD_CLIENT_SECRET
 #   OIDC_SIGNING_PRIVATE_KEY   (PKCS#8 PEM)
 #   OIDC_CLIENT_SECRETS_JSON   ({"client_id": "secret"} for confidential clients)
+#   OIDC_ADMIN_API_TOKEN       (bearer token for /admin/clients; unset = admin API disabled)
 
 [observability]
 enabled = true
@@ -36,8 +37,13 @@ enabled = true
 [durable_objects]
 bindings = [
   { name = "AUTHORIZATION_STATE", class_name = "AuthorizationState" },
+  { name = "CLIENT_REGISTRY", class_name = "ClientRegistryState" },
 ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AuthorizationState"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ClientRegistryState"]

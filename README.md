@@ -86,7 +86,41 @@ ID Token の `aud` は Provider 全体の固定値ではなく、authorization r
 
 別の OIDC Client が認証した場合、public subject を採用している限り `iss` と `sub` は同じまま、`aud` がその Client の `client_id` になります。
 
-初期設計では Dynamic Client Registration は実装せず、明示的な static client registry を利用します。
+Client registry は次の 2 層構成です。
+
+- **static registry**: `OIDC_CLIENTS_JSON` に設定する bootstrap / legacy client。read-only であり、lookup では常に dynamic registry より優先されます。
+- **dynamic registry**: 運用者が admin API (`/admin/clients`) 経由で登録する client。SQLite-backed Durable Object に永続化され、issue された `client_id` は `oji_` prefix を持ちます。
+
+RFC 7591 の Dynamic Client Registration (公開 self-service registration) は実装しません。登録は常に運用者を介します。
+
+## Relying Party として接続する (OJIverse)
+
+OJIverse 向け deployment の issuer は次の値です。
+
+```text
+https://discord.id.ojiver.se
+```
+
+OJIverse service を実装する developer は、Discord OAuth2 や Discord API を直接実装せず、通常の OIDC Relying Party として接続します。
+
+- flow: **Authorization Code Flow + PKCE (`S256`)**
+- scope: `openid` のみ
+- canonical identity: **`(iss, sub)`** — `sub` は stable Discord user ID (Snowflake)
+- confidential client は `client_secret_basic`、public client は `none` + PKCE
+
+標準的な OIDC client library であれば、issuer URL からの discovery で設定できます。
+
+```text
+issuer = https://discord.id.ojiver.se
+  → GET /.well-known/openid-configuration
+  → authorization_endpoint / token_endpoint / jwks_uri を自動構成
+```
+
+registration の流れ:
+
+1. developer は redirect URI と owner (自身の Discord user ID) を OJIverse の運用者へ提出する
+2. 運用者は admin API で client を登録し、発行された `client_id` (confidential の場合は一度だけ表示される `client_secret`) を developer へ渡す
+3. developer は `client_id` (+ `client_secret`) と issuer URL で通常の OIDC RP を構成する
 
 ## Target platform
 
@@ -94,9 +128,9 @@ Cloudflare 上での運用を前提とします。
 
 想定コンポーネント:
 
-- Cloudflare Workers: OIDC / Discord OAuth2 HTTP endpoints
-- SQLite-backed Durable Objects: authorization transaction、single-use authorization code、必要な短期 state
-- Worker Secrets: Discord client secret、OIDC signing private key、confidential OIDC client secret
+- Cloudflare Workers: OIDC / Discord OAuth2 HTTP endpoints、admin API
+- SQLite-backed Durable Objects: authorization transaction、single-use authorization code、dynamic client registry
+- Worker Secrets: Discord client secret、OIDC signing private key、admin API token、confidential OIDC client secret (static client 用)
 - Custom Domain: stable OIDC issuer URL
 
 Cloudflare 固有機能は実装基盤として利用しますが、Relying Party との契約は標準 OIDC over HTTPS とします。
@@ -114,6 +148,8 @@ GET  /oauth/discord/callback
 POST /token
 GET  /jwks.json
 ```
+
+これとは別に、public OIDC surface ではない private control plane として bearer 認証付きの admin API (`/admin/clients`) を提供します。
 
 必要に応じて `/userinfo` を追加します。
 
@@ -133,7 +169,7 @@ OIDC_CLIENTS_JSON=...
 OIDC_SIGNING_KEY_ID=...
 ```
 
-`OIDC_CLIENTS_JSON` は、少数の trusted OIDC Client を静的に登録する用途です。
+`OIDC_CLIENTS_JSON` は、少数の trusted OIDC Client を静的に登録する bootstrap registry です。実行時に追加される client は dynamic registry (admin API) を利用します。`OIDC_CLIENTS_JSON` 側の client は read-only であり、admin API からの変更は `409 static_client_immutable` で拒否されます。
 
 例:
 
@@ -158,7 +194,9 @@ OIDC_SIGNING_KEY_ID=...
 ```text
 DISCORD_CLIENT_SECRET
 OIDC_SIGNING_PRIVATE_KEY
-confidential OIDC client secrets (when supported)
+OIDC_ADMIN_API_TOKEN          # /admin/clients の bearer token
+confidential OIDC client secrets (static clients のみ。dynamic client の
+                              # secret は provider 側で生成・hash 保存される)
 ```
 
 詳細は [docs/SECURITY.md](./docs/SECURITY.md) を参照してください。

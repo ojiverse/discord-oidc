@@ -11,6 +11,7 @@ use url::{form_urlencoded, Url};
 use crate::config::Config;
 use crate::error::{error_page, OAuthErrorCode};
 use crate::pkce;
+use crate::resolver::ClientResolver;
 use crate::response::CoreResponse;
 use crate::store::AuthorizationStore;
 use crate::transaction::AuthorizationTransaction;
@@ -134,7 +135,14 @@ fn redirect_err(
 }
 
 /// Validates a raw `/authorize` query string.
-pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict {
+///
+/// The client is resolved through `resolver` (static registry first, then the
+/// dynamic registry); unknown *or disabled* clients are rejected in place —
+/// their redirect URIs are never treated as trustworthy.
+pub async fn validate_authorize_request<R: ClientResolver + ?Sized>(
+    query: &str,
+    resolver: &R,
+) -> AuthorizeVerdict {
     if query.len() > MAX_QUERY_LEN {
         return render(400, "invalid_request", "request too large");
     }
@@ -145,8 +153,10 @@ pub fn validate_authorize_request(query: &str, cfg: &Config) -> AuthorizeVerdict
         Ok(Some(id)) if id.len() <= MAX_PARAM_LEN => id,
         _ => return render(400, "invalid_request", "missing or invalid client_id"),
     };
-    let Some(client) = cfg.clients.find(client_id) else {
-        return render(400, "unauthorized_client", "unknown client_id");
+    let client = match resolver.find_client(client_id).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return render(400, "unauthorized_client", "unknown or disabled client_id"),
+        Err(_) => return render(500, "server_error", "client registry failure"),
     };
     let redirect_uri = match single(&params, "redirect_uri") {
         Ok(Some(uri)) if uri.len() <= MAX_PARAM_LEN => uri,
@@ -306,14 +316,15 @@ pub fn redirect_with_params(uri: &str, pairs: &[(&str, &str)]) -> String {
 
 /// Full `/authorize` handler: validate, persist a transaction, and produce
 /// the Discord redirect (or an error response).
-pub async fn handle_authorize<S: AuthorizationStore, E: Entropy>(
+pub async fn handle_authorize<S: AuthorizationStore, E: Entropy, R: ClientResolver + ?Sized>(
     query: &str,
     cfg: &Config,
     store: &S,
+    resolver: &R,
     entropy: &mut E,
     now: i64,
 ) -> CoreResponse {
-    match validate_authorize_request(query, cfg) {
+    match validate_authorize_request(query, resolver).await {
         AuthorizeVerdict::RenderError {
             status,
             title,

@@ -5,6 +5,7 @@
 mod discord_http;
 mod do_store;
 mod durable;
+mod registry_client;
 mod webcrypto;
 
 use std::cell::RefCell;
@@ -14,6 +15,7 @@ use futures_util::future::{FutureExt, LocalBoxFuture, Shared};
 use oidc_core::config::{Config, ConfigInput};
 use oidc_core::jwk::jwks_document;
 use oidc_core::jwt::IdTokenSigner;
+use oidc_core::resolver::RegistryResolver;
 use oidc_core::response::CoreResponse;
 use oidc_core::util::Entropy;
 use serde_json::json;
@@ -21,6 +23,7 @@ use worker::{console_error, console_log, event, Context, Date, Env, Method, Requ
 
 use discord_http::DiscordHttp;
 use do_store::DoStore;
+use registry_client::RegistryClient;
 use webcrypto::WebCryptoSigner;
 
 /// Config + Web Crypto signing key, initialized once per isolate.
@@ -141,12 +144,85 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     result
 }
 
+/// Admin control plane. Authentication happens before any other work: an
+/// unauthenticated caller never reaches the runtime, the Durable Objects,
+/// or the request body. The Authorization header and body are never logged.
+async fn route_admin(
+    req: &mut Request,
+    env: &Env,
+    method: Method,
+    path: &str,
+) -> worker::Result<Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let admin_token = env
+        .secret("OIDC_ADMIN_API_TOKEN")
+        .ok()
+        .map(|s| s.to_string());
+    if !oidc_core::admin::authorize_admin(authorization.as_deref(), admin_token.as_deref()) {
+        return to_response(CoreResponse::json_no_store(
+            401,
+            json!({ "error": "unauthorized" }),
+        ));
+    }
+
+    // Authenticated — only now load runtime and the registry stub. Admin
+    // responses are always `Cache-Control: no-store`, including failures.
+    let rt = match runtime(env).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            console_error!("configuration error: {e}");
+            return to_response(CoreResponse::json_no_store(
+                500,
+                json!({ "error": "server_error" }),
+            ));
+        }
+    };
+    let registry = RegistryClient::from_env(env);
+    let now = now_unix();
+    let mut entropy = WorkerEntropy;
+
+    // Only the routes that consume a body get their body read: POST
+    // /admin/clients (create) and PUT /admin/clients/{id} (update).
+    let needs_body = match method {
+        Method::Post => path == "/admin/clients",
+        Method::Put => path
+            .strip_prefix("/admin/clients/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/')),
+        _ => false,
+    };
+    let body = if needs_body {
+        Some(req.text().await.unwrap_or_default())
+    } else {
+        None
+    };
+    to_response(
+        oidc_core::admin::handle_admin_request(
+            method.as_ref(),
+            path,
+            body.as_deref(),
+            authorization.as_deref(),
+            admin_token.as_deref(),
+            &rt.cfg,
+            &registry,
+            &mut entropy,
+            now,
+        )
+        .await,
+    )
+}
+
 async fn route(
     req: &mut Request,
     env: &Env,
     method: Method,
     path: &str,
 ) -> worker::Result<Response> {
+    // Private control plane is authenticated before any shared
+    // infrastructure runs — see `route_admin`.
+    if path == "/admin" || path.starts_with("/admin/") {
+        return route_admin(req, env, method, path).await;
+    }
+
     // Config errors are logged server-side; the client gets a bare 500.
     let rt = match runtime(env).await {
         Ok(rt) => rt,
@@ -162,6 +238,10 @@ async fn route(
             return json_response(500, json!({ "error": "server_error" }));
         }
     };
+    // The registry client degrades to always-error when the binding is
+    // absent; static clients keep working in that case.
+    let registry = RegistryClient::from_env(env);
+    let resolver = RegistryResolver::new(&rt.cfg, &registry);
     let now = now_unix();
     let mut entropy = WorkerEntropy;
     let query = req.url()?.query().unwrap_or_default().to_string();
@@ -176,13 +256,22 @@ async fn route(
             json_response(200, jwks_document(&keys))
         }
         (Method::Get, "/authorize") => to_response(
-            oidc_core::handle_authorize(&query, &rt.cfg, &store, &mut entropy, now).await,
+            oidc_core::handle_authorize(&query, &rt.cfg, &store, &resolver, &mut entropy, now)
+                .await,
         ),
         (Method::Get, "/oauth/discord/callback") => {
             let discord = DiscordHttp::new(&rt.cfg);
             to_response(
-                oidc_core::handle_callback(&query, &rt.cfg, &store, &discord, &mut entropy, now)
-                    .await,
+                oidc_core::handle_callback(
+                    &query,
+                    &rt.cfg,
+                    &store,
+                    &resolver,
+                    &discord,
+                    &mut entropy,
+                    now,
+                )
+                .await,
             )
         }
         (Method::Post, "/token") => {
@@ -206,6 +295,7 @@ async fn route(
                     auth_header.as_deref(),
                     &rt.cfg,
                     &store,
+                    &resolver,
                     &rt.signer,
                     &mut entropy,
                     now,
