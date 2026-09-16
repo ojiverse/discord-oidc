@@ -165,12 +165,16 @@ async fn route_admin(
         ));
     }
 
-    // Authenticated — only now load runtime and the registry stub.
+    // Authenticated — only now load runtime and the registry stub. Admin
+    // responses are always `Cache-Control: no-store`, including failures.
     let rt = match runtime(env).await {
         Ok(rt) => rt,
         Err(e) => {
             console_error!("configuration error: {e}");
-            return json_response(500, json!({ "error": "server_error" }));
+            return to_response(CoreResponse::json_no_store(
+                500,
+                json!({ "error": "server_error" }),
+            ));
         }
     };
     let registry = RegistryClient::from_env(env);

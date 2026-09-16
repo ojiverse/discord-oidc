@@ -13,7 +13,7 @@ use subtle::ConstantTimeEq;
 
 use crate::client::ClientConfig;
 use crate::config::Config;
-use crate::registry::{DynamicClientRegistry, RegistryStoreError};
+use crate::registry::{is_dynamic_client_id, DynamicClientRegistry, RegistryStoreError};
 
 /// Resolves OIDC clients for the authorization/token data plane.
 ///
@@ -88,6 +88,13 @@ impl<D: DynamicClientRegistry> ClientResolver for RegistryResolver<'_, D> {
         if let Some(client) = self.cfg.clients.find(client_id) {
             return Ok(Some(client.clone()));
         }
+        // Only well-formed dynamic IDs reach the store: an arbitrary request
+        // `client_id` is untrusted input, and one containing `/`/`.` segments
+        // could alias an existing record through URL normalization inside the
+        // Durable Object stub.
+        if !is_dynamic_client_id(client_id) {
+            return Ok(None);
+        }
         let record = self.dynamic.get(client_id).await?;
         Ok(record
             .filter(|r| r.is_active())
@@ -104,6 +111,10 @@ impl<D: DynamicClientRegistry> ClientResolver for RegistryResolver<'_, D> {
             return Ok(self.cfg.client_secret(client_id).is_some_and(|expected| {
                 bool::from(expected.as_bytes().ct_eq(presented_secret.as_bytes()))
             }));
+        }
+        // Same format guard as `find_client` — see there.
+        if !is_dynamic_client_id(client_id) {
+            return Ok(false);
         }
         let Some(record) = self.dynamic.get(client_id).await? else {
             return Ok(false);

@@ -17,8 +17,8 @@ use subtle::ConstantTimeEq;
 use crate::client::{ClientConfig, ClientType};
 use crate::config::Config;
 use crate::registry::{
-    generate_client_id, generate_client_secret, validate_metadata, ClientStatus,
-    DynamicClientRecord, DynamicClientRegistry, RotateOutcome,
+    generate_client_id, generate_client_secret, is_dynamic_client_id, validate_metadata,
+    ClientStatus, DynamicClientRecord, DynamicClientRegistry, RotateOutcome,
 };
 use crate::response::CoreResponse;
 use crate::util::Entropy;
@@ -155,6 +155,13 @@ fn static_conflict(cfg: &Config, client_id: &str) -> Option<CoreResponse> {
         .map(|_| admin_error(409, "static_client_immutable", None))
 }
 
+/// After the static check: a `client_id` that cannot be a dynamic record is
+/// reported as not found without touching the registry — untrusted path ids
+/// must never alias a stored record (see [`is_dynamic_client_id`]).
+fn dynamic_id_or_not_found(client_id: &str) -> Option<CoreResponse> {
+    (!is_dynamic_client_id(client_id)).then(client_not_found)
+}
+
 async fn create_client<D: DynamicClientRegistry, E: Entropy>(
     body: Option<&str>,
     cfg: &Config,
@@ -235,6 +242,9 @@ async fn get_client<D: DynamicClientRegistry>(
             extra_headers: Vec::new(),
         };
     }
+    if let Some(resp) = dynamic_id_or_not_found(client_id) {
+        return resp;
+    }
     match registry.get(client_id).await {
         Ok(Some(record)) => CoreResponse::Json {
             status: 200,
@@ -255,6 +265,9 @@ async fn update_client<D: DynamicClientRegistry>(
     now: i64,
 ) -> CoreResponse {
     if let Some(resp) = static_conflict(cfg, client_id) {
+        return resp;
+    }
+    if let Some(resp) = dynamic_id_or_not_found(client_id) {
         return resp;
     }
     let req: UpdateClientRequest = match parse_body(body) {
@@ -291,6 +304,9 @@ async fn set_status<D: DynamicClientRegistry>(
     if let Some(resp) = static_conflict(cfg, client_id) {
         return resp;
     }
+    if let Some(resp) = dynamic_id_or_not_found(client_id) {
+        return resp;
+    }
     match registry.set_status(client_id, status, now).await {
         Ok(Some(record)) => CoreResponse::Json {
             status: 200,
@@ -311,6 +327,9 @@ async fn rotate_secret<D: DynamicClientRegistry, E: Entropy>(
     now: i64,
 ) -> CoreResponse {
     if let Some(resp) = static_conflict(cfg, client_id) {
+        return resp;
+    }
+    if let Some(resp) = dynamic_id_or_not_found(client_id) {
         return resp;
     }
     let secret = generate_client_secret(entropy);

@@ -177,6 +177,24 @@ pub fn generate_client_id(entropy: &mut impl Entropy) -> String {
     format!("{CLIENT_ID_PREFIX}{}", b64url_encode(&buf))
 }
 
+/// Whether `client_id` matches the dynamic-ID format (`oji_` + 22
+/// base64url-no-pad characters).
+///
+/// The data plane must apply this filter before consulting the dynamic
+/// registry: an arbitrary request `client_id` is untrusted input, and an
+/// identifier containing `/` or `.` segments could alias an existing record
+/// through URL path normalization inside the Durable Object stub. OIDC
+/// `client_id`s are opaque and must match exactly.
+pub fn is_dynamic_client_id(client_id: &str) -> bool {
+    let Some(rest) = client_id.strip_prefix(CLIENT_ID_PREFIX) else {
+        return false;
+    };
+    rest.len() == 22
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// A freshly generated confidential client secret.
 pub struct IssuedSecret {
     /// 256-bit base64url plaintext; returned to the caller exactly once.

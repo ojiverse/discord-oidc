@@ -472,7 +472,36 @@ fn get_and_list_cover_static_and_dynamic() {
 fn get_unknown_client_is_404() {
     let cfg = test_config();
     let reg = InMemoryClientRegistry::new();
-    let (status, body) = authed("GET", "/admin/clients/oji_missing", None, &cfg, &reg, 1);
+    let (status, body) = authed(
+        "GET",
+        "/admin/clients/oji_missing_0123456789abcd",
+        None,
+        &cfg,
+        &reg,
+        1,
+    );
+    assert_eq!(status, 404);
+    assert_eq!(body["error"], "client_not_found");
+}
+
+#[test]
+fn malformed_client_id_is_not_found_without_registry_lookup() {
+    // A path id outside the dynamic ID format must be rejected before the
+    // registry is consulted: `..`, `?`, or wrong-length ids could otherwise
+    // alias a stored record through URL normalization in the DO stub URL.
+    let cfg = test_config();
+    let reg = InMemoryClientRegistry::new();
+    for path in [
+        "/admin/clients/..",
+        "/admin/clients/oji_x%3f..%2fother",
+        "/admin/clients/oji_missing_0123456789abc", // one char short
+    ] {
+        let (status, body) = authed("GET", path, None, &cfg, &reg, 1);
+        assert_eq!(status, 404, "{path}");
+        assert_eq!(body["error"], "client_not_found", "{path}");
+    }
+    // Same on a mutation route.
+    let (status, body) = authed("POST", "/admin/clients/../disable", None, &cfg, &reg, 1);
     assert_eq!(status, 404);
     assert_eq!(body["error"], "client_not_found");
 }
@@ -562,7 +591,7 @@ fn update_unknown_is_404_and_static_is_409() {
     .to_string();
     let (status, body) = authed(
         "PUT",
-        "/admin/clients/oji_missing",
+        "/admin/clients/oji_missing_0123456789abcd",
         Some(&put),
         &cfg,
         &reg,
@@ -650,7 +679,7 @@ fn disable_enable_on_unknown_and_static() {
     for action in ["disable", "enable"] {
         let (status, body) = authed(
             "POST",
-            &format!("/admin/clients/oji_missing/{action}"),
+            &format!("/admin/clients/oji_missing_0123456789abcd/{action}"),
             None,
             &cfg,
             &reg,
@@ -765,7 +794,7 @@ fn rotate_on_public_is_400_and_static_or_unknown_rejected() {
 
     let (status, body) = authed(
         "POST",
-        "/admin/clients/oji_missing/rotate-secret",
+        "/admin/clients/oji_missing_0123456789abcd/rotate-secret",
         None,
         &cfg,
         &reg,

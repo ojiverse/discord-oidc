@@ -149,21 +149,21 @@ fn authorize_accepts_dynamic_public_and_confidential() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT],
         None,
     );
     insert_client(
         &reg,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         ClientType::Confidential,
         &[DYN_REDIRECT],
         Some(DYN_SECRET),
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
 
-    for client_id in ["oji_dyn_pub", "oji_dyn_conf"] {
+    for client_id in ["oji_dyn_pub_0123456789abcd", "oji_dyn_conf_0123456789abc"] {
         let resp = authorize_dyn(&cfg, &store, &resolver, client_id, DYN_REDIRECT);
         let loc = location_of(&resp);
         assert!(
@@ -188,15 +188,15 @@ fn authorize_rejects_unknown_and_disabled_dynamic() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT],
         None,
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
 
-    for client_id in ["oji_never_registered", "oji_dyn_pub_disabled"] {
-        if client_id == "oji_dyn_pub_disabled" {
+    for client_id in ["oji_never_reg_0123456789", "oji_dyn_pub_dis_0123456789"] {
+        if client_id == "oji_dyn_pub_dis_0123456789" {
             insert_client(&reg, client_id, ClientType::Public, &[DYN_REDIRECT], None);
             block_on(reg.set_status(client_id, ClientStatus::Disabled, NOW)).unwrap();
         }
@@ -209,13 +209,50 @@ fn authorize_rejects_unknown_and_disabled_dynamic() {
 }
 
 #[test]
+fn malformed_dynamic_id_never_aliases_a_registered_client() {
+    // `x/../oji_<id>` would normalize to `/clients/oji_<id>` inside the DO
+    // stub URL, making one client an alias of another. The resolver must
+    // reject any client_id outside the dynamic ID format before the
+    // registry is consulted — client_ids are opaque and match exactly.
+    let cfg = test_config();
+    let reg = InMemoryClientRegistry::new();
+    insert_client(
+        &reg,
+        "oji_dyn_pub_0123456789abcd",
+        ClientType::Public,
+        &[DYN_REDIRECT],
+        None,
+    );
+    let resolver = RegistryResolver::new(&cfg, &reg);
+
+    for evil in [
+        "x/../oji_dyn_pub_0123456789abcd",
+        "./oji_dyn_pub_0123456789abcd",
+        "oji_dyn_pub_0123456789abcd/../y",
+        "oji_dyn_pub_0123456789abcd?x=1",
+        "oji_dyn_pub_0123456789abc",   // one char short
+        "oji_dyn_pub_0123456789abcde", // one char long
+        "oji_dyn_pub_0123456789ab+d",  // non-base64url char
+    ] {
+        assert!(
+            block_on(resolver.find_client(evil)).unwrap().is_none(),
+            "{evil} must not resolve"
+        );
+        assert!(
+            !block_on(resolver.verify_client_secret(evil, "s", NOW)).unwrap(),
+            "{evil} must not authenticate"
+        );
+    }
+}
+
+#[test]
 fn authorize_dynamic_enforces_exact_redirect_match() {
     let cfg = test_config();
     let store = InMemoryStore::new();
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT, DYN_REDIRECT_ALT],
         None,
@@ -224,7 +261,7 @@ fn authorize_dynamic_enforces_exact_redirect_match() {
 
     // Both registered URIs work.
     for uri in [DYN_REDIRECT, DYN_REDIRECT_ALT] {
-        let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub", uri);
+        let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub_0123456789abcd", uri);
         assert!(matches!(resp, CoreResponse::Redirect(_)), "{uri}");
     }
     // Unregistered values — including near-misses — render a local error,
@@ -234,7 +271,7 @@ fn authorize_dynamic_enforces_exact_redirect_match() {
         "https://svc.ojiverse.example/auth/callback?x=1",
         "https://evil.example/auth/callback",
     ] {
-        let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub", uri);
+        let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub_0123456789abcd", uri);
         let (status, _) = html_of(&resp);
         assert_eq!(status, 400, "{uri}");
     }
@@ -250,7 +287,7 @@ fn callback_rejects_client_disabled_mid_flow() {
     let discord = MockDiscord::default();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT],
         None,
@@ -258,11 +295,22 @@ fn callback_rejects_client_disabled_mid_flow() {
     let resolver = RegistryResolver::new(&cfg, &reg);
 
     // /authorize succeeds while the client is active.
-    let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub", DYN_REDIRECT);
+    let resp = authorize_dyn(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_pub_0123456789abcd",
+        DYN_REDIRECT,
+    );
     let state = query_params(&location_of(&resp))["state"].clone();
 
     // Admin disables the client before Discord redirects back.
-    block_on(reg.set_status("oji_dyn_pub", ClientStatus::Disabled, NOW + 1)).unwrap();
+    block_on(reg.set_status(
+        "oji_dyn_pub_0123456789abcd",
+        ClientStatus::Disabled,
+        NOW + 1,
+    ))
+    .unwrap();
 
     let q = format!("code=discord-auth-code&state={state}");
     let resp = block_on(handle_callback(
@@ -293,7 +341,7 @@ fn callback_rejects_client_gone_mid_flow() {
     let resolver = RegistryResolver::new(&cfg, &reg);
     let tx = block_on(seed_transaction_for(
         &store,
-        "oji_ghost",
+        "oji_ghost_0123456789abcdef",
         DYN_REDIRECT,
         "openid",
     ));
@@ -325,18 +373,29 @@ fn callback_rejects_redirect_uri_removed_mid_flow() {
     let discord = MockDiscord::default();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT, DYN_REDIRECT_ALT],
         None,
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
 
-    let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub", DYN_REDIRECT);
+    let resp = authorize_dyn(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_pub_0123456789abcd",
+        DYN_REDIRECT,
+    );
     let state = query_params(&location_of(&resp))["state"].clone();
 
     // Admin removes the in-flight redirect URI from the registration.
-    block_on(reg.update_metadata("oji_dyn_pub", &meta(&[DYN_REDIRECT_ALT]), NOW + 1)).unwrap();
+    block_on(reg.update_metadata(
+        "oji_dyn_pub_0123456789abcd",
+        &meta(&[DYN_REDIRECT_ALT]),
+        NOW + 1,
+    ))
+    .unwrap();
 
     let q = format!("code=discord-auth-code&state={state}");
     let resp = block_on(handle_callback(
@@ -363,19 +422,30 @@ fn callback_allows_client_reenabled_before_return() {
     let discord = MockDiscord::default();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT],
         None,
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
 
-    let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub", DYN_REDIRECT);
+    let resp = authorize_dyn(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_pub_0123456789abcd",
+        DYN_REDIRECT,
+    );
     let state = query_params(&location_of(&resp))["state"].clone();
 
     // Disable then re-enable before the callback arrives.
-    block_on(reg.set_status("oji_dyn_pub", ClientStatus::Disabled, NOW + 1)).unwrap();
-    block_on(reg.set_status("oji_dyn_pub", ClientStatus::Active, NOW + 2)).unwrap();
+    block_on(reg.set_status(
+        "oji_dyn_pub_0123456789abcd",
+        ClientStatus::Disabled,
+        NOW + 1,
+    ))
+    .unwrap();
+    block_on(reg.set_status("oji_dyn_pub_0123456789abcd", ClientStatus::Active, NOW + 2)).unwrap();
 
     let q = format!("code=discord-auth-code&state={state}");
     let resp = block_on(handle_callback(
@@ -403,18 +473,25 @@ fn token_dynamic_public_pkce_success() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT],
         None,
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
-    let code = issue_code(&cfg, &store, &resolver, "oji_dyn_pub", DYN_REDIRECT, 1);
+    let code = issue_code(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_pub_0123456789abcd",
+        DYN_REDIRECT,
+        1,
+    );
     let resp = exchange(
         &cfg,
         &store,
         &resolver,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         DYN_REDIRECT,
         &code,
         None,
@@ -423,7 +500,7 @@ fn token_dynamic_public_pkce_success() {
     let (status, json) = json_of(&resp);
     assert_eq!(status, 200);
     let (_, claims, ..) = decode_jwt(json["id_token"].as_str().unwrap());
-    assert_eq!(claims["aud"], "oji_dyn_pub");
+    assert_eq!(claims["aud"], "oji_dyn_pub_0123456789abcd");
     assert_eq!(claims["iss"], ISSUER);
     assert_eq!(claims["sub"], DISCORD_USER_ID);
 }
@@ -435,19 +512,26 @@ fn token_dynamic_confidential_basic_success() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         ClientType::Confidential,
         &[DYN_REDIRECT],
         Some(DYN_SECRET),
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
-    let code = issue_code(&cfg, &store, &resolver, "oji_dyn_conf", DYN_REDIRECT, 1);
-    let auth = basic_auth("oji_dyn_conf", DYN_SECRET);
+    let code = issue_code(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_conf_0123456789abc",
+        DYN_REDIRECT,
+        1,
+    );
+    let auth = basic_auth("oji_dyn_conf_0123456789abc", DYN_SECRET);
     let resp = exchange(
         &cfg,
         &store,
         &resolver,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         DYN_REDIRECT,
         &code,
         Some(&auth),
@@ -465,7 +549,7 @@ fn token_dynamic_confidential_wrong_or_missing_secret() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         ClientType::Confidential,
         &[DYN_REDIRECT],
         Some(DYN_SECRET),
@@ -473,7 +557,7 @@ fn token_dynamic_confidential_wrong_or_missing_secret() {
     let resolver = RegistryResolver::new(&cfg, &reg);
 
     for (i, auth) in [
-        Some(basic_auth("oji_dyn_conf", "wrong-secret")),
+        Some(basic_auth("oji_dyn_conf_0123456789abc", "wrong-secret")),
         // A confidential client that skips Basic entirely is also
         // `invalid_client`, never a public-client exchange.
         None,
@@ -485,7 +569,7 @@ fn token_dynamic_confidential_wrong_or_missing_secret() {
             &cfg,
             &store,
             &resolver,
-            "oji_dyn_conf",
+            "oji_dyn_conf_0123456789abc",
             DYN_REDIRECT,
             i as u64 + 1,
         );
@@ -493,7 +577,7 @@ fn token_dynamic_confidential_wrong_or_missing_secret() {
             &cfg,
             &store,
             &resolver,
-            "oji_dyn_conf",
+            "oji_dyn_conf_0123456789abc",
             DYN_REDIRECT,
             &code,
             auth.as_deref(),
@@ -522,19 +606,26 @@ fn token_dynamic_public_rejects_basic_header() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT],
         None,
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
-    let code = issue_code(&cfg, &store, &resolver, "oji_dyn_pub", DYN_REDIRECT, 1);
-    let auth = basic_auth("oji_dyn_pub", "any-secret");
+    let code = issue_code(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_pub_0123456789abcd",
+        DYN_REDIRECT,
+        1,
+    );
+    let auth = basic_auth("oji_dyn_pub_0123456789abcd", "any-secret");
     let resp = exchange(
         &cfg,
         &store,
         &resolver,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         DYN_REDIRECT,
         &code,
         Some(&auth),
@@ -552,7 +643,7 @@ fn token_rotation_overlap_accepts_previous_secret() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         ClientType::Confidential,
         &[DYN_REDIRECT],
         Some(DYN_SECRET),
@@ -561,8 +652,12 @@ fn token_rotation_overlap_accepts_previous_secret() {
 
     // Rotate at NOW: current -> DYN_SECRET_2, previous -> DYN_SECRET until
     // NOW + 600.
-    block_on(reg.rotate_secret("oji_dyn_conf", &sha256_b64url(DYN_SECRET_2.as_bytes()), NOW))
-        .unwrap();
+    block_on(reg.rotate_secret(
+        "oji_dyn_conf_0123456789abc",
+        &sha256_b64url(DYN_SECRET_2.as_bytes()),
+        NOW,
+    ))
+    .unwrap();
 
     // End-to-end within the authorization-code TTL (60s): both the current
     // and the rotated-out previous secret authenticate.
@@ -571,16 +666,16 @@ fn token_rotation_overlap_accepts_previous_secret() {
             &cfg,
             &store,
             &resolver,
-            "oji_dyn_conf",
+            "oji_dyn_conf_0123456789abc",
             DYN_REDIRECT,
             i as u64 + 1,
         );
-        let auth = basic_auth("oji_dyn_conf", secret);
+        let auth = basic_auth("oji_dyn_conf_0123456789abc", secret);
         let resp = exchange(
             &cfg,
             &store,
             &resolver,
-            "oji_dyn_conf",
+            "oji_dyn_conf_0123456789abc",
             DYN_REDIRECT,
             &code,
             Some(&auth),
@@ -598,13 +693,19 @@ fn token_rotation_overlap_accepts_previous_secret() {
         (NOW + SECRET_ROTATION_OVERLAP_SECS + 3600, false),
     ] {
         assert_eq!(
-            block_on(resolver.verify_client_secret("oji_dyn_conf", DYN_SECRET, now)).unwrap(),
+            block_on(resolver.verify_client_secret("oji_dyn_conf_0123456789abc", DYN_SECRET, now))
+                .unwrap(),
             expect,
             "previous secret at now={now}"
         );
         // The current secret is unaffected by the window.
         assert!(
-            block_on(resolver.verify_client_secret("oji_dyn_conf", DYN_SECRET_2, now)).unwrap(),
+            block_on(resolver.verify_client_secret(
+                "oji_dyn_conf_0123456789abc",
+                DYN_SECRET_2,
+                now
+            ))
+            .unwrap(),
             "current secret at now={now}"
         );
     }
@@ -617,19 +718,23 @@ fn token_second_rotation_drops_oldest_secret() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         ClientType::Confidential,
         &[DYN_REDIRECT],
         Some(DYN_SECRET),
     );
     let resolver = RegistryResolver::new(&cfg, &reg);
 
-    block_on(reg.rotate_secret("oji_dyn_conf", &sha256_b64url(DYN_SECRET_2.as_bytes()), NOW))
-        .unwrap();
+    block_on(reg.rotate_secret(
+        "oji_dyn_conf_0123456789abc",
+        &sha256_b64url(DYN_SECRET_2.as_bytes()),
+        NOW,
+    ))
+    .unwrap();
     // Second rotation inside the first overlap: only the immediately
     // previous secret is retained — the original is dead immediately.
     block_on(reg.rotate_secret(
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         &sha256_b64url(DYN_SECRET_3.as_bytes()),
         NOW + 5,
     ))
@@ -647,16 +752,16 @@ fn token_second_rotation_drops_oldest_secret() {
             &cfg,
             &store,
             &resolver,
-            "oji_dyn_conf",
+            "oji_dyn_conf_0123456789abc",
             DYN_REDIRECT,
             i as u64 + 1,
         );
-        let auth = basic_auth("oji_dyn_conf", secret);
+        let auth = basic_auth("oji_dyn_conf_0123456789abc", secret);
         let resp = exchange(
             &cfg,
             &store,
             &resolver,
-            "oji_dyn_conf",
+            "oji_dyn_conf_0123456789abc",
             DYN_REDIRECT,
             &code,
             Some(&auth),
@@ -674,14 +779,14 @@ fn token_rejects_disabled_dynamic_clients() {
     let reg = InMemoryClientRegistry::new();
     insert_client(
         &reg,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         ClientType::Public,
         &[DYN_REDIRECT],
         None,
     );
     insert_client(
         &reg,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         ClientType::Confidential,
         &[DYN_REDIRECT],
         Some(DYN_SECRET),
@@ -689,19 +794,33 @@ fn token_rejects_disabled_dynamic_clients() {
     let resolver = RegistryResolver::new(&cfg, &reg);
 
     // Codes are issued while both clients are active.
-    let pub_code = issue_code(&cfg, &store, &resolver, "oji_dyn_pub", DYN_REDIRECT, 1);
-    let conf_code = issue_code(&cfg, &store, &resolver, "oji_dyn_conf", DYN_REDIRECT, 2);
+    let pub_code = issue_code(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_pub_0123456789abcd",
+        DYN_REDIRECT,
+        1,
+    );
+    let conf_code = issue_code(
+        &cfg,
+        &store,
+        &resolver,
+        "oji_dyn_conf_0123456789abc",
+        DYN_REDIRECT,
+        2,
+    );
 
     // Disable both; issued codes cannot be exchanged afterward — the
     // exchange fails authentication before the code is even evaluated.
-    block_on(reg.set_status("oji_dyn_pub", ClientStatus::Disabled, NOW)).unwrap();
-    block_on(reg.set_status("oji_dyn_conf", ClientStatus::Disabled, NOW)).unwrap();
+    block_on(reg.set_status("oji_dyn_pub_0123456789abcd", ClientStatus::Disabled, NOW)).unwrap();
+    block_on(reg.set_status("oji_dyn_conf_0123456789abc", ClientStatus::Disabled, NOW)).unwrap();
 
     let resp = exchange(
         &cfg,
         &store,
         &resolver,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         DYN_REDIRECT,
         &pub_code,
         None,
@@ -711,12 +830,12 @@ fn token_rejects_disabled_dynamic_clients() {
     assert_eq!(status, 401);
     assert_eq!(json["error"], "invalid_client");
 
-    let auth = basic_auth("oji_dyn_conf", DYN_SECRET);
+    let auth = basic_auth("oji_dyn_conf_0123456789abc", DYN_SECRET);
     let resp = exchange(
         &cfg,
         &store,
         &resolver,
-        "oji_dyn_conf",
+        "oji_dyn_conf_0123456789abc",
         DYN_REDIRECT,
         &conf_code,
         Some(&auth),
@@ -728,12 +847,12 @@ fn token_rejects_disabled_dynamic_clients() {
 
     // The failed exchanges did not burn the codes: after re-enable they
     // still work.
-    block_on(reg.set_status("oji_dyn_pub", ClientStatus::Active, NOW)).unwrap();
+    block_on(reg.set_status("oji_dyn_pub_0123456789abcd", ClientStatus::Active, NOW)).unwrap();
     let resp = exchange(
         &cfg,
         &store,
         &resolver,
-        "oji_dyn_pub",
+        "oji_dyn_pub_0123456789abcd",
         DYN_REDIRECT,
         &pub_code,
         None,
