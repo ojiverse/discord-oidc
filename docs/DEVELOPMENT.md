@@ -167,8 +167,13 @@ The job then runs `wrangler deploy` (which rebuilds the wasm via the
 secrets with `wrangler secret bulk`, and finishes with a smoke check that
 fetches the discovery document and JWKS from `OIDC_ISSUER_URL` — so a
 deploy is only green once the live Worker answers correctly.
-`secret bulk` is upsert-only: removing a Worker secret is a manual
-`wrangler secret delete`.
+`secret bulk` is upsert-only: it never deletes a Worker secret, so the sync
+step **requires** `OIDC_ADMIN_API_TOKEN` and fails the deploy when the
+1Password variable is absent — otherwise a previously-synced token would
+silently stay active. To revoke the credential, run
+`wrangler secret delete OIDC_ADMIN_API_TOKEN` (this also disables the admin
+API, which fails closed to 401); removing the 1Password variable alone does
+not unset the Worker secret.
 
 One-time setup, none of which lives in the repository:
 

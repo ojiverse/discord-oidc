@@ -30,9 +30,6 @@ use webcrypto::WebCryptoSigner;
 struct Runtime {
     cfg: Config,
     signer: WebCryptoSigner,
-    /// `OIDC_ADMIN_API_TOKEN` secret; `None` disables the admin API (all
-    /// requests fail closed as `401 unauthorized`).
-    admin_token: Option<String>,
 }
 
 /// `load_runtime` is async (Web Crypto `importKey`), so initialization is
@@ -80,11 +77,7 @@ async fn load_runtime(env: Env) -> Result<Runtime, String> {
     )
     .await
     .map_err(|e| e.to_string())?;
-    Ok(Runtime {
-        cfg,
-        signer,
-        admin_token: secret("OIDC_ADMIN_API_TOKEN"),
-    })
+    Ok(Runtime { cfg, signer })
 }
 
 /// Cryptographically secure entropy from the Workers runtime.
@@ -151,12 +144,81 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     result
 }
 
+/// Admin control plane. Authentication happens before any other work: an
+/// unauthenticated caller never reaches the runtime, the Durable Objects,
+/// or the request body. The Authorization header and body are never logged.
+async fn route_admin(
+    req: &mut Request,
+    env: &Env,
+    method: Method,
+    path: &str,
+) -> worker::Result<Response> {
+    let authorization = req.headers().get("authorization").ok().flatten();
+    let admin_token = env
+        .secret("OIDC_ADMIN_API_TOKEN")
+        .ok()
+        .map(|s| s.to_string());
+    if !oidc_core::admin::authorize_admin(authorization.as_deref(), admin_token.as_deref()) {
+        return to_response(CoreResponse::json_no_store(
+            401,
+            json!({ "error": "unauthorized" }),
+        ));
+    }
+
+    // Authenticated — only now load runtime and the registry stub.
+    let rt = match runtime(env).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            console_error!("configuration error: {e}");
+            return json_response(500, json!({ "error": "server_error" }));
+        }
+    };
+    let registry = RegistryClient::from_env(env);
+    let now = now_unix();
+    let mut entropy = WorkerEntropy;
+
+    // Only the routes that consume a body get their body read: POST
+    // /admin/clients (create) and PUT /admin/clients/{id} (update).
+    let needs_body = match method {
+        Method::Post => path == "/admin/clients",
+        Method::Put => path
+            .strip_prefix("/admin/clients/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/')),
+        _ => false,
+    };
+    let body = if needs_body {
+        Some(req.text().await.unwrap_or_default())
+    } else {
+        None
+    };
+    to_response(
+        oidc_core::admin::handle_admin_request(
+            method.as_ref(),
+            path,
+            body.as_deref(),
+            authorization.as_deref(),
+            admin_token.as_deref(),
+            &rt.cfg,
+            &registry,
+            &mut entropy,
+            now,
+        )
+        .await,
+    )
+}
+
 async fn route(
     req: &mut Request,
     env: &Env,
     method: Method,
     path: &str,
 ) -> worker::Result<Response> {
+    // Private control plane is authenticated before any shared
+    // infrastructure runs — see `route_admin`.
+    if path == "/admin" || path.starts_with("/admin/") {
+        return route_admin(req, env, method, path).await;
+    }
+
     // Config errors are logged server-side; the client gets a bare 500.
     let rt = match runtime(env).await {
         Ok(rt) => rt,
@@ -179,30 +241,6 @@ async fn route(
     let now = now_unix();
     let mut entropy = WorkerEntropy;
     let query = req.url()?.query().unwrap_or_default().to_string();
-
-    // Private control plane: bearer-authenticated admin API. The
-    // Authorization header and any request body are never logged.
-    if path == "/admin" || path.starts_with("/admin/") {
-        let body = match method {
-            Method::Post | Method::Put => Some(req.text().await.unwrap_or_default()),
-            _ => None,
-        };
-        let authorization = req.headers().get("authorization").ok().flatten();
-        return to_response(
-            oidc_core::admin::handle_admin_request(
-                method.as_ref(),
-                path,
-                body.as_deref(),
-                authorization.as_deref(),
-                rt.admin_token.as_deref(),
-                &rt.cfg,
-                &registry,
-                &mut entropy,
-                now,
-            )
-            .await,
-        );
-    }
 
     match (method, path) {
         (Method::Get, "/.well-known/openid-configuration") => {

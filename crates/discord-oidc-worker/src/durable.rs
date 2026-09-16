@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use oidc_core::code::{evaluate_code_exchange, ConsumeDeny, StoredAuthorizationCode};
-use oidc_core::registry::{ClientMetadata, ClientStatus, DynamicClientRecord};
+use oidc_core::registry::{ClientMetadata, DynamicClientRecord};
 use oidc_core::transaction::AuthorizationTransaction;
 use serde::{Deserialize, Serialize};
 use worker::js_sys;
@@ -199,14 +199,14 @@ fn client_key(client_id: &str) -> String {
     format!("{CLIENT_PREFIX}{client_id}")
 }
 
-/// Wire reply for `POST /insert`.
+/// Wire reply for `PUT /clients/{id}`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InsertReply {
     /// Whether the record was inserted (`false` = `client_id` already used).
     pub inserted: bool,
 }
 
-/// Wire reply for `POST /rotate-secret`.
+/// Wire reply for `POST /clients/{id}/rotate-secret`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RotateSecretReply {
@@ -219,32 +219,38 @@ pub enum RotateSecretReply {
 }
 
 #[derive(Deserialize)]
-struct ClientIdRequest {
-    client_id: String,
-}
-
-#[derive(Deserialize)]
 struct UpdateMetadataRequest {
-    client_id: String,
     metadata: ClientMetadata,
     now: i64,
 }
 
 #[derive(Deserialize)]
-struct SetStatusRequest {
-    client_id: String,
-    status: ClientStatus,
+struct StatusRequest {
     now: i64,
 }
 
 #[derive(Deserialize)]
 struct RotateSecretRequest {
-    client_id: String,
     new_secret_hash: String,
     now: i64,
 }
 
 /// Singleton dynamic client registry.
+///
+/// Internal contract (not a public API — only the Worker stub calls it):
+///
+/// ```text
+/// GET  /clients
+/// GET  /clients/{client_id}
+/// PUT  /clients/{client_id}                 (insert; 409 on existing id)
+/// POST /clients/{client_id}/disable
+/// POST /clients/{client_id}/enable
+/// POST /clients/{client_id}/rotate-secret
+/// POST /clients/{client_id}/update          (metadata replace; the one
+///                                           endpoint beyond the minimum
+///                                           contract, needed for an atomic
+///                                           read-modify-write)
+/// ```
 ///
 /// Storage adapter only: every endpoint performs its read-modify-write inside
 /// one fetch invocation, which the runtime serializes — no concurrent update
@@ -256,83 +262,113 @@ pub struct ClientRegistryState {
     state: State,
 }
 
+impl ClientRegistryState {
+    /// `GET /clients` — all records ordered by `client_id`.
+    async fn list(&self) -> worker::Result<Response> {
+        let map = self.state.storage().list().await?;
+        let mut records: Vec<DynamicClientRecord> = Vec::new();
+        let entries = map.entries();
+        loop {
+            let next = entries.next()?;
+            if next.done() {
+                break;
+            }
+            let pair = js_sys::Array::from(&next.value());
+            let key = pair.get(0).as_string().unwrap_or_default();
+            if !key.starts_with(CLIENT_PREFIX) {
+                continue;
+            }
+            records.push(serde_wasm_bindgen::from_value(pair.get(1))?);
+        }
+        records.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        Response::from_json(&records)
+    }
+
+    /// Applies `f` to the stored record and persists it. Returns the
+    /// updated record (`None` when absent).
+    async fn mutate<F>(&self, client_id: &str, f: F) -> worker::Result<Option<DynamicClientRecord>>
+    where
+        F: FnOnce(&mut DynamicClientRecord),
+    {
+        let storage = self.state.storage();
+        let key = client_key(client_id);
+        let record: Option<DynamicClientRecord> =
+            match storage.get::<DynamicClientRecord>(&key).await? {
+                Some(mut r) => {
+                    f(&mut r);
+                    storage.put(&key, &r).await?;
+                    Some(r)
+                }
+                None => None,
+            };
+        Ok(record)
+    }
+}
+
 impl DurableObject for ClientRegistryState {
     fn new(state: State, _env: Env) -> Self {
         Self { state }
     }
 
     async fn fetch(&self, mut req: Request) -> worker::Result<Response> {
-        let storage = self.state.storage();
         let url = req.url()?;
-        match (req.method(), url.path()) {
-            (Method::Post, "/get") => {
-                let body: ClientIdRequest = req.json().await?;
+        let Some(rest) = url.path().strip_prefix("/clients") else {
+            return Response::error("not found", 404);
+        };
+        if rest.is_empty() {
+            return match req.method() {
+                Method::Get => self.list().await,
+                _ => Response::error("method not allowed", 405),
+            };
+        }
+        if !rest.starts_with('/') {
+            return Response::error("not found", 404);
+        }
+        let segments: Vec<&str> = rest.trim_start_matches('/').split('/').collect();
+        match (req.method(), segments.as_slice()) {
+            (Method::Get, [id]) => {
                 let record: Option<DynamicClientRecord> =
-                    storage.get(&client_key(&body.client_id)).await?;
-                Response::from_json(&record)
-            }
-            (Method::Post, "/list") => {
-                let map = storage.list().await?;
-                let mut records: Vec<DynamicClientRecord> = Vec::new();
-                let entries = map.entries();
-                loop {
-                    let next = entries.next()?;
-                    if next.done() {
-                        break;
-                    }
-                    let pair = js_sys::Array::from(&next.value());
-                    let key = pair.get(0).as_string().unwrap_or_default();
-                    if !key.starts_with(CLIENT_PREFIX) {
-                        continue;
-                    }
-                    records.push(serde_wasm_bindgen::from_value(pair.get(1))?);
+                    self.state.storage().get(&client_key(id)).await?;
+                match record {
+                    Some(r) => Response::from_json(&r),
+                    None => Response::error("not found", 404),
                 }
-                records.sort_by(|a, b| a.client_id.cmp(&b.client_id));
-                Response::from_json(&records)
             }
-            (Method::Post, "/insert") => {
+            (Method::Put, [id]) => {
                 let record: DynamicClientRecord = req.json().await?;
-                let key = client_key(&record.client_id);
+                if &record.client_id != id {
+                    return Response::error("client_id mismatch", 400);
+                }
+                let storage = self.state.storage();
+                let key = client_key(id);
                 let inserted = storage.get::<serde_json::Value>(&key).await?.is_none();
                 if inserted {
                     storage.put(&key, &record).await?;
                 }
                 Response::from_json(&InsertReply { inserted })
+                    .map(|r| r.with_status(if inserted { 201 } else { 409 }))
             }
-            (Method::Post, "/update-metadata") => {
+            (Method::Post, [id, "update"]) => {
                 let body: UpdateMetadataRequest = req.json().await?;
-                let key = client_key(&body.client_id);
-                let record: Option<DynamicClientRecord> =
-                    match storage.get::<DynamicClientRecord>(&key).await? {
-                        Some(mut r) => {
-                            r.apply_metadata(body.metadata, body.now);
-                            storage.put(&key, &r).await?;
-                            Some(r)
-                        }
-                        None => None,
-                    };
+                let record = self
+                    .mutate(id, |r| r.apply_metadata(body.metadata, body.now))
+                    .await?;
                 Response::from_json(&record)
             }
-            (Method::Post, "/set-status") => {
-                let body: SetStatusRequest = req.json().await?;
-                let key = client_key(&body.client_id);
-                let record: Option<DynamicClientRecord> =
-                    match storage.get::<DynamicClientRecord>(&key).await? {
-                        Some(mut r) => {
-                            match body.status {
-                                ClientStatus::Active => r.enable(body.now),
-                                ClientStatus::Disabled => r.disable(body.now),
-                            }
-                            storage.put(&key, &r).await?;
-                            Some(r)
-                        }
-                        None => None,
-                    };
+            (Method::Post, [id, "disable"]) => {
+                let body: StatusRequest = req.json().await?;
+                let record = self.mutate(id, |r| r.disable(body.now)).await?;
                 Response::from_json(&record)
             }
-            (Method::Post, "/rotate-secret") => {
+            (Method::Post, [id, "enable"]) => {
+                let body: StatusRequest = req.json().await?;
+                let record = self.mutate(id, |r| r.enable(body.now)).await?;
+                Response::from_json(&record)
+            }
+            (Method::Post, [id, "rotate-secret"]) => {
                 let body: RotateSecretRequest = req.json().await?;
-                let key = client_key(&body.client_id);
+                let key = client_key(id);
+                let storage = self.state.storage();
                 let reply = match storage.get::<DynamicClientRecord>(&key).await? {
                     Some(mut r) => match r.rotate_secret(body.new_secret_hash, body.now) {
                         Ok(_) => {

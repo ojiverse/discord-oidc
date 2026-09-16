@@ -314,6 +314,48 @@ fn callback_rejects_client_gone_mid_flow() {
 }
 
 #[test]
+fn callback_rejects_redirect_uri_removed_mid_flow() {
+    // /authorize succeeds with redirect A, then an admin PUT removes A from
+    // the client's redirect_uris. The callback must not redirect there —
+    // even though the client is still active — and must not touch Discord
+    // or issue a code.
+    let cfg = test_config();
+    let store = InMemoryStore::new();
+    let reg = InMemoryClientRegistry::new();
+    let discord = MockDiscord::default();
+    insert_client(
+        &reg,
+        "oji_dyn_pub",
+        ClientType::Public,
+        &[DYN_REDIRECT, DYN_REDIRECT_ALT],
+        None,
+    );
+    let resolver = RegistryResolver::new(&cfg, &reg);
+
+    let resp = authorize_dyn(&cfg, &store, &resolver, "oji_dyn_pub", DYN_REDIRECT);
+    let state = query_params(&location_of(&resp))["state"].clone();
+
+    // Admin removes the in-flight redirect URI from the registration.
+    block_on(reg.update_metadata("oji_dyn_pub", &meta(&[DYN_REDIRECT_ALT]), NOW + 1)).unwrap();
+
+    let q = format!("code=discord-auth-code&state={state}");
+    let resp = block_on(handle_callback(
+        &q,
+        &cfg,
+        &store,
+        &resolver,
+        &discord,
+        &mut entropy(),
+        NOW + 2,
+    ));
+    let (status, html) = html_of(&resp);
+    assert_eq!(status, 403);
+    assert!(html.contains("unauthorized_client"));
+    assert_eq!(discord.exchange_count.get(), 0);
+    assert_eq!(store.code_count(), 0);
+}
+
+#[test]
 fn callback_allows_client_reenabled_before_return() {
     let cfg = test_config();
     let store = InMemoryStore::new();

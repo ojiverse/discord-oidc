@@ -156,7 +156,7 @@ API error、rate limit、判定不能な response の場合は fail-open せず 
 Client registry は read-only の static registry と、admin API で管理する dynamic registry の 2 層です。
 
 - **static registry**: `OIDC_CLIENTS_JSON` に設定する bootstrap / legacy client。deploy 時にのみ変更でき、admin API からの一切の変更は `409 static_client_immutable` で拒否されます。
-- **dynamic registry**: `ClientRegistryState` Durable Object (SQLite-backed) に永続化される実行時 registry。`POST /admin/clients` などの admin endpoint 経由でのみ変更します。
+- **dynamic registry**: `ClientRegistryState` Durable Object (SQLite-backed) に永続化される実行時 registry。`POST /admin/clients` などの admin endpoint 経由でのみ変更します。Worker 内部から DO への呼び出しは `GET /clients`、`GET/PUT /clients/{id}`、`POST /clients/{id}/{disable,enable,rotate-secret,update}` の内部 contract で行い、各 mutation は単一 fetch 内の read-modify-write として直列化されます。
 
 `client_id` の resolution は常に static registry を先に検索し、存在しない場合に dynamic registry を検索します。dynamic `client_id` は `oji_` + 128 bit random (base64url) であり、static client との衝突は generation 時に skip します。
 
@@ -216,7 +216,7 @@ created_at / updated_at / disabled_at
 
 policy は固定です。public client は `token_endpoint_auth_method=none`、confidential client は `client_secret_basic` であり、どちらも scope は `openid` のみです。
 
-`status=disabled` の client は `/authorize` (redirect せずその場で error render)、callback (`unauthorized_client`)、`/token` (`invalid_client`) のすべてで拒否されます。`/authorize` 通過後に disable された client は、Discord code の交換も provider code の発行も行われません。code を発行済みであっても `/token` で client authentication が再評価されるため、disable 後の exchange は失敗します。
+`status=disabled` の client は `/authorize` (redirect せずその場で error render)、callback (`unauthorized_client`)、`/token` (`invalid_client`) のすべてで拒否されます。`/authorize` 通過後に disable された client は、Discord code の交換も provider code の発行も行われません。callback では client が active であっても、transaction が持つ `redirect_uri` が現在の `redirect_uris` に残っているかを再検査します — admin PUT で flow 途中に redirect URI が削除された場合も `unauthorized_client` で停止し、削除済み URI へは一切 redirect しません (upstream error の転送も含む)。code を発行済みであっても `/token` で client authentication が再評価されるため、disable 後の exchange は失敗します。
 
 confidential client の secret は server 側で 256 bit random として生成され、plaintext は create / rotate の response で一度だけ返されます。storage には SHA-256 hash のみ保存されます。rotation 時、旧 secret は 600 秒の overlap window 中のみ受け付け、2 回目の rotation でさらに古い secret は即座に失効します。public client に secret は存在せず、rotation は `client_has_no_secret` で拒否されます。
 

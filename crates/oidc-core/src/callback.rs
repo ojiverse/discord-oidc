@@ -116,8 +116,8 @@ pub async fn handle_callback<
     // client is disabled, no authentication result — including an upstream
     // error — may reach the RP. The provider renders a local error page
     // instead of redirecting to the (no longer trusted) redirect_uri.
-    match resolver.find_client(&tx.oidc_client_id).await {
-        Ok(Some(_)) => {}
+    let client = match resolver.find_client(&tx.oidc_client_id).await {
+        Ok(Some(client)) => client,
         Ok(None) => {
             return render(
                 403,
@@ -128,6 +128,16 @@ pub async fn handle_callback<
         Err(_) => {
             return render(500, "server_error", "client registry failure");
         }
+    };
+    // The redirect_uri may have been removed from the registration since
+    // /authorize (admin PUT). If it is no longer registered, nothing —
+    // including an upstream error — may be redirected there.
+    if !client.redirect_uris.contains(&tx.redirect_uri) {
+        return render(
+            403,
+            "unauthorized_client",
+            "redirect_uri is no longer registered",
+        );
     }
 
     if let Some(upstream_error) = error {
