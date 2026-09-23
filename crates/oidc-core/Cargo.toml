@@ -16,5 +16,5 @@ url.workspace = true
 percent-encoding = "2"
 
 [dev-dependencies]
-rand = "0.8"
+rand = "0.10"
 pollster = "0.4"
